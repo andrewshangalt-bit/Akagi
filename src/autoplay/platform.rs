@@ -5,7 +5,8 @@
 //! later (DOM-based clicks or direct WS inject) without touching the
 //! manager's bus subscription / timing logic.
 
-use crate::config::MajsoulAutoplayConfig;
+use crate::autoplay::delay::{BudgetSnapshot, DecisionProbs, Reading};
+use crate::config::{DelayModelConfig, MajsoulAutoplayConfig};
 use crate::game_state::snapshot::GameStateSnapshot;
 use crate::schema::MjaiEvent;
 use riichienv_core::action::Action;
@@ -22,21 +23,42 @@ pub enum Step {
     /// pre-click "thinking" delay and the inter-click gap inside one
     /// action.
     Sleep { duration_ms: u32 },
-}
-
-/// State machine for handling Majsoul's fused reach+discard: the platform
-/// emits one reach action that combines the declaration and the discard,
-/// so we click reach first, await the bot's follow-up `Dahai`, then click
-/// the discard tile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReachState {
-    #[default]
-    Idle,
-    /// Path B: we clicked the reach button and injected a synthetic
-    /// `Reach` event into MjaiBus. The next `Dahai` from the bot is the
-    /// riichi tile and must be clicked even though the bot didn't pre-fill
-    /// `Reach.pai`.
-    AwaitingDahai,
+    /// Click the first DOM element the page has out of `selectors`.
+    ///
+    /// Tenhou wires its own action buttons through a document-level click
+    /// listener keyed on `name="c<handler>-<arg>"`, so dispatching a real
+    /// click on one runs the client's own handler — the action is performed
+    /// exactly as if the user had pressed it, with none of the coordinate
+    /// guessing a canvas needs. `label` is for logs only.
+    ///
+    /// A list, because some actions are offered under more than one slot and
+    /// which ones exist depends on the hand: the pon that keeps a red five
+    /// out of the meld is only drawn when there is a red five to keep. The
+    /// order is the caller's preference, not the document's.
+    DomClick {
+        selectors: Vec<String>,
+        label: String,
+    },
+    /// Block until the client is ready to take input, then continue.
+    ///
+    /// Frame arrival is not the start of the turn. Tenhou's server can send
+    /// several seats' actions at once — against millisecond-fast opponents it
+    /// routinely does — while the client spends seconds animating them, and
+    /// only then draws the buttons and starts its clock. Everything timed
+    /// from frame arrival is timed from the wrong instant.
+    AwaitReady { timeout_ms: u32 },
+    /// Discard the tile with this Tenhou index (`0..=135`) through the
+    /// client's own handler.
+    ///
+    /// Not a position: the client's discard entry point is addressed by tile,
+    /// so it resolves the rest itself — including where the tile currently
+    /// sits, which is why calls moving the hand cannot affect this.
+    Discard { tile_index: u32 },
+    /// Transmit a pre-built wire frame to the game server through the MITM
+    /// proxy's injection channel (Riichi City: no browser page exists to
+    /// click, so the action goes out as the client's own protocol frame).
+    /// See `bridge::riichi_city::build` and `autoplay::inject`.
+    SendFrame(Vec<u8>),
 }
 
 /// Everything the platform impl needs to translate one bot decision
@@ -67,34 +89,44 @@ pub struct ActionContext<'a> {
     /// kyoku ends. While set, dahai clicks are suppressed (Majsoul auto-
     /// discards in riichi mode).
     pub self_riichi_accepted: bool,
-    /// Reach two-step state (see [`ReachState`]).
-    pub reach_state: ReachState,
     /// 3 (sanma) or 4 (yonma).
     pub num_players: u8,
     /// Per-platform config knobs (delays, mouse-move emission, ...).
     pub cfg: &'a MajsoulAutoplayConfig,
+    /// Delay-model parameters (see `autoplay::delay`). Owned: it is a
+    /// small parameter block cloned per bot response, which keeps test
+    /// construction free of an extra borrow.
+    pub delay_cfg: DelayModelConfig,
+    /// Server time budget for the current decision window, if known.
+    /// `None` off-Majsoul or before the first operation list arrives.
+    pub budget: Option<BudgetSnapshot>,
+    /// Normalized bot confidence for this decision, if the bot's meta
+    /// could be interpreted (see `autoplay::delay::probs`).
+    pub probs: Option<DecisionProbs>,
+    /// Table facts and the second opinion on this decision (see
+    /// `autoplay::delay::Reading`), read by the manager from the tracked
+    /// game state the same way on every platform. Delay scripts only; never
+    /// the action.
+    pub reading: Reading,
+    /// User Lua delay policy, when loaded. Consulted by the delay model;
+    /// on any script failure the built-in policy runs instead.
+    pub delay_script: Option<&'a crate::autoplay::delay::DelayScript>,
+    /// Tenhou only: the bridge's hand at Tenhou tile-index resolution plus
+    /// the current decision window. `None` on other platforms, and on
+    /// Tenhou before the first parsed frame.
+    pub tenhou: Option<&'a crate::autoplay::tenhou_state::TenhouState>,
 }
 
-/// Output of `PlatformAutoplay::plan`. Captures both the click sequence
-/// and the side-effect signal the manager needs to fulfil Path B reach
-/// (inject a synthetic `Reach` event back to MjaiBus so the bot emits
-/// the follow-up dahai).
+/// Output of `PlatformAutoplay::plan`: the click sequence to execute.
+///
+/// The riichi declaring discard is always resolved before the plan is
+/// built — the bot fills `Reach.pai` (natively or via the manager's
+/// autoplay reach follow-up, see `bot::manager` and #257) — so both
+/// platforms declare and discard in a single plan; there is no
+/// bus-injection follow-up path.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PlanResult {
     pub steps: Vec<Step>,
-    /// When `true`, the manager should send a synthetic
-    /// `MjaiEvent::Reach { actor: our_seat, pai: None }` onto MjaiBus
-    /// after the steps run, and transition `ReachState` to
-    /// `AwaitingDahai`. Set only when the bot's `Reach` event omits
-    /// `pai` and the platform needs a follow-up dahai.
-    pub inject_reach_for_followup: bool,
-    /// When `true`, the next bot Dahai for our seat is the riichi tile
-    /// and should be clicked even if the manager has flipped its
-    /// `self_riichi_accepted` gate. Currently always set together with
-    /// `inject_reach_for_followup`; kept as a separate flag so future
-    /// platforms can express other "treat next dahai specially"
-    /// situations.
-    pub awaiting_riichi_dahai: bool,
 }
 
 pub trait PlatformAutoplay: Send + Sync {

@@ -7,6 +7,7 @@ import { toast } from '@/components/ui/sonner'
 import { useConfigStore } from '@/stores/configStore'
 import type { Product } from '@/lib/products'
 import type {
+  CreatedCheckout,
   CreatedOrder,
   CreatedSubscription,
   KeyStatus,
@@ -16,11 +17,14 @@ import type {
 } from '@/types'
 
 // Drives the self-serve key purchase handshake (see the inference server's API documentation):
-// create → open approve_url in the browser → poll *-result every few seconds
-// → the key.
+// create → open the provider's checkout page in the browser → poll *-result
+// every few seconds → the key. Two providers share this machine: PayPal
+// (order/subscription endpoints) and Creem (one checkout endpoint + one poll
+// whose payload matches the order poll for both product kinds).
 //
 // How the key arrives depends on the purchase:
-//  - subscription           → the poll carries it directly.
+//  - subscription           → the poll carries it directly (Creem marks the
+//                             recurring kind with `days: 0`).
 //  - one-time, new key      → `create-order` is sent `redeem: true`, so the
 //                             SERVER redeems the prepaid code and the poll
 //                             carries the key. The buyer's backup email then
@@ -50,10 +54,19 @@ const POLL_BACKOFF_MAX_MS = 30_000
 /** Client-side cap ≈ the server's 1h retrieval window, plus slack. */
 const POLL_DEADLINE_MS = 65 * 60_000
 
+/**
+ * Which payment provider carries the purchase. PayPal splits by product kind
+ * (`create-order` / `create-subscription`, each with its own poll); Creem is
+ * one `create-checkout` + one `/creem/result` poll for both kinds, and that
+ * poll's payload matches the PayPal order poll (`OrderResult`) — so the Creem
+ * path routes everything, subscriptions included, through the order handler.
+ */
+export type PaymentProvider = 'paypal' | 'creem'
+
 export type PurchasePhase =
   | 'idle'
-  | 'creating' // create-order / create-subscription in flight
-  | 'approving' // buyer is on PayPal; polling *-result
+  | 'creating' // create-order / create-subscription / create-checkout in flight
+  | 'approving' // buyer is on the provider's checkout page; polling *-result
   | 'redeeming' // client-side redeem in flight: code arrived, /v3/redeem running
   | 'redeem_failed' // /v3/redeem failed — code is safe and shown for retry
   | 'done' // key minted / key extended
@@ -62,7 +75,10 @@ export type PurchasePhase =
 
 type StartOpts = {
   baseUrl: string
+  /** Proxy URL for the inference server ('' = direct). */
+  proxy: string
   product: Product
+  provider: PaymentProvider
   /** One-time purchases: stack the bought time onto this existing key. */
   renewKey?: string
 }
@@ -70,7 +86,9 @@ type StartOpts = {
 type PurchaseStore = {
   phase: PurchasePhase
   product: Product | null
+  provider: PaymentProvider
   baseUrl: string
+  proxy: string
   approveUrl: string | null
   /** One-time: the prepaid redeem code once `ready` (also emailed). */
   code: string | null
@@ -122,7 +140,12 @@ function clearTimer() {
 const initial = {
   phase: 'idle' as PurchasePhase,
   product: null,
+  // Creem is the app's primary provider; the dialog only reaches PayPal via
+  // an explicit opt-in click. (Pre-start this value is cosmetic — `start()`
+  // always stamps the caller's choice.)
+  provider: 'creem' as PaymentProvider,
   baseUrl: '',
+  proxy: '',
   approveUrl: null,
   code: null,
   key: null,
@@ -177,6 +200,7 @@ export const usePurchaseStore = create<PurchaseStore>((set, get) => {
       // payer's address, so there is no separate account email to link here.
       const resp = await invoke<RedeemResponse>('native_api_redeem', {
         baseUrl: s.baseUrl,
+        proxy: s.proxy,
         code,
         renewKey: s.renewKey ?? undefined,
       })
@@ -210,6 +234,7 @@ export const usePurchaseStore = create<PurchaseStore>((set, get) => {
     try {
       const st = await invoke<KeyStatus>('native_api_key_status', {
         baseUrl: get().baseUrl,
+        proxy: get().proxy,
         key,
       })
       if (gen !== generation) return
@@ -269,7 +294,10 @@ export const usePurchaseStore = create<PurchaseStore>((set, get) => {
     }
   }
 
-  const poll = async (gen: number, ids: { orderId?: string; subscriptionId?: string; claim: string }) => {
+  const poll = async (
+    gen: number,
+    ids: { orderId?: string; subscriptionId?: string; checkoutId?: string; claim: string },
+  ) => {
     if (gen !== generation || get().phase !== 'approving') return
     if (Date.now() - startedAt > POLL_DEADLINE_MS) {
       // Not paid within the retrieval window. If the buyer DID pay at the
@@ -277,9 +305,23 @@ export const usePurchaseStore = create<PurchaseStore>((set, get) => {
       return fail('timeout', null)
     }
     try {
-      if (ids.orderId) {
+      if (ids.checkoutId) {
+        // Creem: one poll for both product kinds, shaped like the order poll —
+        // a subscription simply arrives as `key` (+ `days: 0`), which the
+        // order handler already delivers key-first.
+        const r = await invoke<OrderResult>('native_api_checkout_result', {
+          baseUrl: get().baseUrl,
+          proxy: get().proxy,
+          checkoutId: ids.checkoutId,
+          claim: ids.claim,
+        })
+        if (gen !== generation) return
+        pollDelay = POLL_MS
+        handleOrderResult(gen, r)
+      } else if (ids.orderId) {
         const r = await invoke<OrderResult>('native_api_order_result', {
           baseUrl: get().baseUrl,
+          proxy: get().proxy,
           orderId: ids.orderId,
           claim: ids.claim,
         })
@@ -289,6 +331,7 @@ export const usePurchaseStore = create<PurchaseStore>((set, get) => {
       } else {
         const r = await invoke<SubscriptionResult>('native_api_subscription_result', {
           baseUrl: get().baseUrl,
+          proxy: get().proxy,
           subscriptionId: ids.subscriptionId,
           claim: ids.claim,
         })
@@ -308,7 +351,12 @@ export const usePurchaseStore = create<PurchaseStore>((set, get) => {
     }
   }
 
-  let activeIds: { orderId?: string; subscriptionId?: string; claim: string } | null = null
+  let activeIds: {
+    orderId?: string
+    subscriptionId?: string
+    checkoutId?: string
+    claim: string
+  } | null = null
 
   const schedulePoll = (gen: number) => {
     clearTimer()
@@ -335,14 +383,32 @@ export const usePurchaseStore = create<PurchaseStore>((set, get) => {
         ...initial,
         phase: 'creating',
         product: opts.product,
+        provider: opts.provider,
         baseUrl: opts.baseUrl,
+        proxy: opts.proxy,
         renewKey,
       })
       void (async () => {
         try {
-          if (opts.product.kind === 'onetime') {
+          if (opts.provider === 'creem') {
+            const o = await invoke<CreatedCheckout>('native_api_create_checkout', {
+              baseUrl: opts.baseUrl,
+              proxy: opts.proxy,
+              product: opts.product.id,
+              // Same rule as the PayPal order: server-side redeem unless the
+              // code itself is needed to renew an existing key. Subscriptions
+              // ignore the flag (they always deliver the key), so `false`
+              // there is correct and simply omitted from the wire.
+              redeem: opts.product.kind === 'onetime' && renewKey === null,
+            })
+            if (gen !== generation) return
+            activeIds = { checkoutId: o.checkout_id, claim: o.claim_secret }
+            set({ phase: 'approving', approveUrl: o.checkout_url })
+            openExternal(o.checkout_url)
+          } else if (opts.product.kind === 'onetime') {
             const o = await invoke<CreatedOrder>('native_api_create_order', {
               baseUrl: opts.baseUrl,
+              proxy: opts.proxy,
               product: opts.product.id,
               // Let the server redeem, unless we need the code itself to aim
               // /v3/redeem at an existing key. Server-side redeem is what puts
@@ -356,6 +422,7 @@ export const usePurchaseStore = create<PurchaseStore>((set, get) => {
           } else {
             const o = await invoke<CreatedSubscription>('native_api_create_subscription', {
               baseUrl: opts.baseUrl,
+              proxy: opts.proxy,
               product: opts.product.id,
             })
             if (gen !== generation) return

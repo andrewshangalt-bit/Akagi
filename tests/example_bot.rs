@@ -91,6 +91,7 @@ fn start_game(seat: u8) -> MjaiEvent {
         aka_flag: Some(true),
         id: Some(seat),
         num_players: 4,
+        game_meta: None,
     }
 }
 
@@ -107,6 +108,7 @@ fn start_kyoku(my_seat: u8, my_tehai: [String; 13]) -> MjaiEvent {
         scores: vec![25000, 25000, 25000, 25000],
         tehais,
         num_players: 4,
+        catch_up: 0,
     }
 }
 
@@ -145,7 +147,7 @@ async fn declares_riichi_when_tenpai_with_two_waits() {
 
     // Clean shutdown — bot's main loop breaks on end_game.
     bot.set_react_timeout(std::time::Duration::from_millis(500));
-    let _ = bot.react(&[MjaiEvent::EndGame]).await;
+    let _ = bot.react(&[MjaiEvent::end_game()]).await;
 }
 
 #[tokio::test]
@@ -183,7 +185,7 @@ async fn discards_min_shanten_when_one_shanten() {
     }
 
     bot.set_react_timeout(std::time::Duration::from_millis(500));
-    let _ = bot.react(&[MjaiEvent::EndGame]).await;
+    let _ = bot.react(&[MjaiEvent::end_game()]).await;
 }
 
 #[tokio::test]
@@ -219,7 +221,7 @@ async fn returns_none_for_others_tsumo() {
     );
 
     bot.set_react_timeout(std::time::Duration::from_millis(500));
-    let _ = bot.react(&[MjaiEvent::EndGame]).await;
+    let _ = bot.react(&[MjaiEvent::end_game()]).await;
 }
 
 #[tokio::test]
@@ -279,5 +281,5 @@ async fn pons_yakuhai_when_shanten_decreases() {
     }
 
     bot.set_react_timeout(std::time::Duration::from_millis(500));
-    let _ = bot.react(&[MjaiEvent::EndGame]).await;
+    let _ = bot.react(&[MjaiEvent::end_game()]).await;
 }

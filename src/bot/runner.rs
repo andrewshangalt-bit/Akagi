@@ -27,9 +27,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::{info, warn};
 
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-
 /// Sentinel that marks a bot stderr line as a frontend notification rather
 /// than a diagnostic log line. The remainder of the line (after this exact
 /// prefix) must be a JSON [`Notification`] object. Kept deliberately
@@ -337,12 +334,13 @@ for line in sys.stdin:
                 aka_flag: None,
                 id: Some(0),
                 num_players: 4,
+                game_meta: None,
             }])
             .await
             .unwrap();
         assert!(matches!(resp.action, MjaiEvent::None));
 
-        let _ = bot.react(&[MjaiEvent::EndGame]).await.unwrap();
+        let _ = bot.react(&[MjaiEvent::end_game()]).await.unwrap();
     }
 
     #[test]
@@ -425,6 +423,7 @@ for line in sys.stdin:
                 aka_flag: None,
                 id: Some(0),
                 num_players: 4,
+                game_meta: None,
             }])
             .await
             .unwrap();
@@ -439,6 +438,6 @@ for line in sys.stdin:
         assert_eq!(n.title, "Bot says hi");
         assert_eq!(n.body.as_deref(), Some("from stderr"));
 
-        let _ = bot.react(&[MjaiEvent::EndGame]).await.unwrap();
+        let _ = bot.react(&[MjaiEvent::end_game()]).await.unwrap();
     }
 }

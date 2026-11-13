@@ -10,6 +10,9 @@ import {
   ShoppingCart,
   AlertTriangle,
   XCircle,
+  Lock,
+  Info,
+  Network,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -22,11 +25,23 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { invoke } from '@/lib/tauri'
 import { toast } from '@/components/ui/sonner'
 import { PurchaseDialog } from '@/components/PurchaseDialog'
+import { useConfigStore } from '@/stores/configStore'
 import { usePurchaseStore, type PurchasePhase } from '@/stores/purchaseStore'
-import type { KeyStatus, ModelInfo, NativeApiConfig, RedeemResponse } from '@/types'
+import { effectiveProxy, isValidProxyUrl } from '@/lib/proxy'
+import { useKeyStatus } from '@/hooks/useKeyStatus'
+import type { ApiHealth, KeyStatus, ModelInfo, NativeApiConfig, RedeemResponse } from '@/types'
+
+/** Shape of a key the server issues: 32 letters and digits, nothing else. */
+const KEY_PATTERN = /^[A-Za-z0-9]{32}$/
 
 /**
  * Controlled editor for the built-in bot's cloud-inference settings
@@ -59,6 +74,7 @@ export function NativeApiFields({
   const [checking, setChecking] = useState(false)
   const [enabling, setEnabling] = useState(false)
   const [checkingHealth, setCheckingHealth] = useState(false)
+  const [testingProxy, setTestingProxy] = useState(false)
   const [loadingModels, setLoadingModels] = useState(false)
   const [status, setStatus] = useState<KeyStatus | null>(null)
   const [models, setModels] = useState<ModelInfo[] | null>(null)
@@ -70,10 +86,20 @@ export function NativeApiFields({
   const set = (patch: Partial<NativeApiConfig>) => onChange({ ...value, ...patch })
   const hasUrlKey = value.base_url.trim() !== '' && value.key.trim() !== ''
 
+  // The server URL is a developer-only field: pointing a novice at a rogue
+  // server is the obvious scam vector, so the input stays locked unless
+  // developer mode (Settings → General) is on. Read from the *saved* config,
+  // not the edited draft — flipping the toggle must be deliberate and saved,
+  // never part of the same unsaved edit that changes the URL.
+  const devMode = useConfigStore((s) => s.config?.general.developer_mode ?? false)
+
+  /** Key we have already adopted, so re-renders don't re-query the server. */
+  const adoptedKeyRef = useRef<string | null>(null)
+
   // Latest `value` as of the last committed render. Async handlers (the model
-  // auto-fill in `toggleEnabled`) resolve against this instead of the snapshot
-  // captured when the request started, so a slow request never clobbers what
-  // the user typed while it was in flight.
+  // auto-fill in `toggleEnabled` / `adoptKey`) resolve against this instead of
+  // the snapshot captured when the request started, so a slow request never
+  // clobbers what the user typed while it was in flight.
   const valueRef = useRef(value)
   useEffect(() => {
     valueRef.current = value
@@ -82,10 +108,49 @@ export function NativeApiFields({
   const queryModels = async (v: NativeApiConfig): Promise<ModelInfo[]> => {
     const list = await invoke<ModelInfo[]>('native_api_models', {
       baseUrl: v.base_url,
+      proxy: effectiveProxy(v),
       key: v.key,
     })
     setModels(list)
     return list
+  }
+
+  /**
+   * A complete key was typed or pasted. Take it from there: ask the server what
+   * models it grants, pick a default for each mode, and switch cloud inference
+   * on.
+   *
+   * Entering a key is the user saying they want the cloud model — making them
+   * then find a toggle (which sits above the field they just filled) and a model
+   * dropdown only invites the state where a key is set and nothing uses it.
+   *
+   * A key the server rejects enables nothing: the error surfaces and the bot
+   * stays local, which beats a config that claims cloud inference it cannot do.
+   */
+  const adoptKey = async (key: string) => {
+    const next = { ...valueRef.current, key }
+    if (!KEY_PATTERN.test(key) || !next.base_url.trim() || adoptedKeyRef.current === key) {
+      onChange(next)
+      return
+    }
+    adoptedKeyRef.current = key
+    onChange(next)
+    setEnabling(true)
+    setErr(null)
+    try {
+      const list = await queryModels(next)
+      const cur = valueRef.current
+      const filled = { ...cur, enabled: true }
+      if (!filled.model_4p) filled.model_4p = list.find((m) => m.game === '4p')?.id ?? ''
+      if (!filled.model_3p) filled.model_3p = list.find((m) => m.game === '3p')?.id ?? ''
+      onChange(filled)
+    } catch (e) {
+      // Let the next edit try again — a rejected key is often a half-pasted one.
+      adoptedKeyRef.current = null
+      setErr(String(e))
+    } finally {
+      setEnabling(false)
+    }
   }
 
   // Turning the API on: flip immediately for a responsive switch, then query
@@ -133,6 +198,7 @@ export function NativeApiFields({
       setStatus(
         await invoke<KeyStatus>('native_api_key_status', {
           baseUrl: value.base_url,
+          proxy: effectiveProxy(value),
           key: value.key,
         }),
       )
@@ -185,16 +251,43 @@ export function NativeApiFields({
     setCheckingHealth(true)
     setErr(null)
     try {
-      const h = await invoke<{ status: string; models: string[] }>('native_api_health', {
+      const h = await invoke<ApiHealth>('native_api_health', {
         baseUrl: value.base_url,
+        proxy: effectiveProxy(value),
       })
-      toast.success(t('bots.api.health_ok', { status: h.status }), {
-        description: h.models.join(', '),
-      })
+      // `degraded` (a worker down) still answers 200 — surface it as a
+      // warning rather than the all-clear toast.
+      const msg = t('bots.api.health_ok', { status: h.status })
+      const opts = { description: t('bots.api.health_queue', { n: h.queue_depth }) }
+      if (h.status === 'ok') toast.success(msg, opts)
+      else toast.warning(msg, opts)
     } catch (e) {
       setErr(String(e))
     } finally {
       setCheckingHealth(false)
+    }
+  }
+
+  // Verify the proxy actually carries traffic: a health check forced through
+  // the typed proxy. The button is only reachable with a valid, enabled proxy,
+  // so reaching the server proves the tunnel works end to end.
+  const testProxy = async () => {
+    if (value.base_url.trim() === '') {
+      setErr(t('bots.api.need_url'))
+      return
+    }
+    setTestingProxy(true)
+    setErr(null)
+    try {
+      const h = await invoke<ApiHealth>('native_api_health', {
+        baseUrl: value.base_url,
+        proxy: value.proxy.trim(),
+      })
+      toast.success(t('bots.api.proxy_ok', { status: h.status }))
+    } catch (e) {
+      setErr(String(e))
+    } finally {
+      setTestingProxy(false)
     }
   }
 
@@ -214,136 +307,218 @@ export function NativeApiFields({
         </div>
       </div>
 
-      <div className="grid gap-1.5">
-        <Label>{t('bots.api.base_url')}</Label>
-        <Input
-          value={value.base_url}
-          onChange={(e) => set({ base_url: e.target.value })}
-          placeholder="https://mjapi.shinkuan.me"
-          autoComplete="off"
-          spellCheck={false}
-        />
-      </div>
-
-      <div className="grid gap-1.5">
-        <Label>{t('bots.api.key')}</Label>
-        <div className="flex gap-2">
+      {/* Everything below the enable switch collapses while MJOT is off — a
+          disabled integration shouldn't cost a wall of fields. The purchase
+          chip and the dialogs stay OUTSIDE the collapse: a purchase started
+          earlier keeps running (and stays reachable) regardless of the
+          switch, and completion auto-enables anyway. */}
+      {value.enabled && (
+        <>
+        {/* The locked explanation is a hover tooltip on the wrapper (not text
+            under the field) — the disabled input itself swallows pointer events,
+            so the title has to live on an enabled ancestor. */}
+        <div className="grid gap-1.5" title={devMode ? undefined : t('bots.api.base_url_locked')}>
+          <Label className="flex items-center gap-1.5">
+            {t('bots.api.base_url')}
+            {!devMode && <Lock className="h-3 w-3 text-muted-foreground" />}
+          </Label>
           <Input
-            type={showKey ? 'text' : 'password'}
-            value={value.key}
-            onChange={(e) => set({ key: e.target.value })}
-            placeholder="••••••••••••••••••••••••••••••••"
+            value={value.base_url}
+            onChange={(e) => set({ base_url: e.target.value })}
+            placeholder="https://mjapi.shinkuan.me"
             autoComplete="off"
             spellCheck={false}
-            className="font-mono"
+            disabled={!devMode}
           />
-          <Button
-            variant="outline"
-            size="icon"
-            className="shrink-0"
-            onClick={() => setShowKey((s) => !s)}
-            title={showKey ? t('bots.api.hide_key') : t('bots.api.show_key')}
-          >
-            {showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-          </Button>
         </div>
-      </div>
 
-      <div className="grid gap-4 sm:grid-cols-2">
         <div className="grid gap-1.5">
-          <Label>{t('bots.api.model_4p')}</Label>
-          <Input
-            value={value.model_4p}
-            onChange={(e) => set({ model_4p: e.target.value })}
-            placeholder="4p-model"
-            autoComplete="off"
-            spellCheck={false}
-            className="font-mono"
-          />
+          <div className="flex items-center justify-between gap-4">
+            <Label className="flex items-center gap-1.5">
+              {t('bots.api.proxy')}
+              <TooltipProvider>
+                <Tooltip delayDuration={100}>
+                  <TooltipTrigger asChild>
+                    <Info className="h-3.5 w-3.5 cursor-help text-muted-foreground" />
+                  </TooltipTrigger>
+                  <TooltipContent side="right">{t('bots.api.proxy_hint')}</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            </Label>
+            <Switch
+              checked={value.proxy_enabled}
+              onCheckedChange={(on) => set({ proxy_enabled: on })}
+            />
+          </div>
+          <div className="flex gap-2">
+            <Input
+              value={value.proxy}
+              onChange={(e) => set({ proxy: e.target.value })}
+              placeholder="socks5://127.0.0.1:1080"
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+              disabled={!value.proxy_enabled}
+            />
+            <Button
+              variant="outline"
+              size="icon"
+              className="shrink-0"
+              onClick={testProxy}
+              disabled={testingProxy || !value.proxy_enabled || !isValidProxyUrl(value.proxy)}
+              title={t('bots.api.test_proxy')}
+            >
+              {testingProxy ? (
+                <RefreshCw className="h-4 w-4 animate-spin" />
+              ) : (
+                <Network className="h-4 w-4" />
+              )}
+            </Button>
+          </div>
+          {value.proxy_enabled && !isValidProxyUrl(value.proxy) && (
+            <span className="text-xs text-red-400">{t('bots.api.proxy_invalid')}</span>
+          )}
         </div>
-        <div className="grid gap-1.5">
-          <Label>{t('bots.api.model_3p')}</Label>
-          <Input
-            value={value.model_3p}
-            onChange={(e) => set({ model_3p: e.target.value })}
-            placeholder="3p-model"
-            autoComplete="off"
-            spellCheck={false}
-            className="font-mono"
-          />
-        </div>
-      </div>
-      <span className="text-xs text-muted-foreground -mt-2">{t('bots.api.model_hint')}</span>
 
-      {models && (
         <div className="grid gap-1.5">
-          <Label className="text-xs text-muted-foreground">{t('bots.api.models_title')}</Label>
-          <div className="flex flex-wrap gap-1.5">
-            {models.length === 0 && (
-              <span className="text-xs text-muted-foreground">{t('bots.api.models_empty')}</span>
-            )}
-            {models.map((m) => (
-              <Button
-                key={m.id}
-                size="sm"
-                variant="secondary"
-                className="h-7 font-mono text-xs"
-                title={m.desc}
-                onClick={() => set(m.game === '3p' ? { model_3p: m.id } : { model_4p: m.id })}
-              >
-                {m.id}
-              </Button>
-            ))}
+          <Label>{t('bots.api.react_timeout')}</Label>
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              inputMode="numeric"
+              min={500}
+              max={10000}
+              step={500}
+              className="max-w-[10rem]"
+              value={value.react_timeout_ms}
+              onChange={(e) => set({ react_timeout_ms: Number(e.target.value || 0) })}
+            />
+            <span className="text-sm text-muted-foreground">{t('bots.api.react_timeout_unit')}</span>
+          </div>
+          <span className="text-xs text-muted-foreground">{t('bots.api.react_timeout_hint')}</span>
+        </div>
+
+        <div className="grid gap-1.5">
+          <Label>{t('bots.api.key')}</Label>
+          <div className="flex gap-2">
+            <Input
+              type={showKey ? 'text' : 'password'}
+              value={value.key}
+              onChange={(e) => void adoptKey(e.target.value.trim())}
+              placeholder="••••••••••••••••••••••••••••••••"
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+            />
+            <Button
+              variant="outline"
+              size="icon"
+              className="shrink-0"
+              onClick={() => setShowKey((s) => !s)}
+              title={showKey ? t('bots.api.hide_key') : t('bots.api.show_key')}
+            >
+              {showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </Button>
           </div>
         </div>
-      )}
 
-      {status && (
-        <div className="grid grid-cols-2 gap-x-6 gap-y-1 rounded-md border border-border p-3 text-sm sm:grid-cols-3">
-          <Kv label={t('bots.api.plan')} value={status.plan || '—'} />
-          <Kv label={t('bots.api.expires')} value={status.expires_at || '—'} />
-          <Kv label={t('bots.api.usage')} value={`${status.usage_today} / ${status.rpd}`} />
-          <Kv label={t('bots.api.rpm')} value={String(status.rpm)} />
-          <Kv label={t('bots.api.topk')} value={String(status.topk)} />
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-1.5">
+            <Label>{t('bots.api.model_4p')}</Label>
+            <Input
+              value={value.model_4p}
+              onChange={(e) => set({ model_4p: e.target.value })}
+              placeholder="4p-model"
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <Label>{t('bots.api.model_3p')}</Label>
+            <Input
+              value={value.model_3p}
+              onChange={(e) => set({ model_3p: e.target.value })}
+              placeholder="3p-model"
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+            />
+          </div>
         </div>
+        <span className="text-xs text-muted-foreground -mt-2">{t('bots.api.model_hint')}</span>
+
+        {models && (
+          <div className="grid gap-1.5">
+            <Label className="text-xs text-muted-foreground">{t('bots.api.models_title')}</Label>
+            <div className="flex flex-wrap gap-1.5">
+              {models.length === 0 && (
+                <span className="text-xs text-muted-foreground">{t('bots.api.models_empty')}</span>
+              )}
+              {models.map((m) => (
+                <Button
+                  key={m.id}
+                  size="sm"
+                  variant="secondary"
+                  className="h-7 font-mono text-xs"
+                  title={m.desc}
+                  onClick={() => set(m.game === '3p' ? { model_3p: m.id } : { model_4p: m.id })}
+                >
+                  {m.id}
+                </Button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {status && (
+          <div className="grid grid-cols-2 gap-x-6 gap-y-1 rounded-md border border-border p-3 text-sm sm:grid-cols-3">
+            <Kv label={t('bots.api.plan')} value={status.plan || '—'} />
+            <Kv label={t('bots.api.expires')} value={status.expires_at || '—'} />
+            <Kv label={t('bots.api.usage')} value={`${status.usage_today} / ${status.rpd}`} />
+            <Kv label={t('bots.api.rpm')} value={String(status.rpm)} />
+            <Kv label={t('bots.api.topk')} value={String(status.topk)} />
+          </div>
+        )}
+
+        {err && <span className="text-sm text-red-400 [overflow-wrap:anywhere]">{err}</span>}
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" size="sm" onClick={checkKey} disabled={checking} className="gap-1.5">
+            <CheckCircle2 className="h-4 w-4" />
+            {checking ? t('bots.api.checking') : t('bots.api.check_key')}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={fetchModels}
+            disabled={loadingModels}
+            className="gap-1.5"
+          >
+            <RefreshCw className={`h-4 w-4 ${loadingModels ? 'animate-spin' : ''}`} />
+            {t('bots.api.fetch_models')}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={health}
+            disabled={checkingHealth}
+            className="gap-1.5"
+          >
+            <Activity className={`h-4 w-4 ${checkingHealth ? 'animate-spin' : ''}`} />
+            {t('bots.api.health')}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setRedeemOpen(true)} className="gap-1.5">
+            <Ticket className="h-4 w-4" />
+            {t('bots.api.redeem')}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setBuyOpen(true)} className="gap-1.5">
+            <ShoppingCart className="h-4 w-4" />
+            {t('bots.api.buy')}
+          </Button>
+        </div>
+        </>
       )}
-
-      {err && <span className="text-sm text-red-400 [overflow-wrap:anywhere]">{err}</span>}
-
-      <div className="flex flex-wrap items-center gap-2">
-        <Button variant="outline" size="sm" onClick={checkKey} disabled={checking} className="gap-1.5">
-          <CheckCircle2 className="h-4 w-4" />
-          {checking ? t('bots.api.checking') : t('bots.api.check_key')}
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={fetchModels}
-          disabled={loadingModels}
-          className="gap-1.5"
-        >
-          <RefreshCw className={`h-4 w-4 ${loadingModels ? 'animate-spin' : ''}`} />
-          {t('bots.api.fetch_models')}
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={health}
-          disabled={checkingHealth}
-          className="gap-1.5"
-        >
-          <Activity className={`h-4 w-4 ${checkingHealth ? 'animate-spin' : ''}`} />
-          {t('bots.api.health')}
-        </Button>
-        <Button variant="outline" size="sm" onClick={() => setRedeemOpen(true)} className="gap-1.5">
-          <Ticket className="h-4 w-4" />
-          {t('bots.api.redeem')}
-        </Button>
-        <Button variant="outline" size="sm" onClick={() => setBuyOpen(true)} className="gap-1.5">
-          <ShoppingCart className="h-4 w-4" />
-          {t('bots.api.buy')}
-        </Button>
-      </div>
 
       {purchasePhase !== 'idle' && !buyOpen && (
         <PurchaseChip phase={purchasePhase} onOpen={() => setBuyOpen(true)} />
@@ -352,6 +527,7 @@ export function NativeApiFields({
       {redeemOpen && (
         <RedeemDialog
           baseUrl={value.base_url}
+          proxy={effectiveProxy(value)}
           currentKey={value.key}
           onClose={() => setRedeemOpen(false)}
           onNewKey={(key) => void adoptNewKey(key)}
@@ -361,6 +537,7 @@ export function NativeApiFields({
       {buyOpen && (
         <PurchaseDialog
           baseUrl={value.base_url}
+          proxy={effectiveProxy(value)}
           currentKey={value.key}
           onClose={() => setBuyOpen(false)}
           onNewKey={(key) => void adoptNewKey(key)}
@@ -410,11 +587,13 @@ function Kv({ label, value }: { label: string; value: string }) {
 
 function RedeemDialog({
   baseUrl,
+  proxy,
   currentKey,
   onClose,
   onNewKey,
 }: {
   baseUrl: string
+  proxy: string
   currentKey: string
   onClose: () => void
   onNewKey: (key: string) => void
@@ -422,10 +601,20 @@ function RedeemDialog({
   const { t } = useTranslation()
   const [code, setCode] = useState('')
   const [email, setEmail] = useState('')
-  const [renew, setRenew] = useState(false)
+  /** The user's explicit renew choice; `null` = not touched, use the default. */
+  const [renewChoice, setRenewChoice] = useState<boolean | null>(null)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [done, setDone] = useState<string | null>(null)
+
+  // Same default as the purchase dialog: whoever redeems a code while already
+  // holding a LIVE key almost always wants more time on it, not a second
+  // credential — so renewal defaults ON when the key checks out (with the
+  // reminder banner below). A code's plan isn't knowable up front, but a
+  // cross-plan renew is rejected with a 400 *without consuming the code*, so
+  // the default is safe even then; an explicit toggle always wins.
+  const keyStatus = useKeyStatus(baseUrl, proxy, currentKey)
+  const renew = renewChoice ?? (keyStatus !== null)
 
   const submit = async () => {
     if (baseUrl.trim() === '') {
@@ -442,6 +631,7 @@ function RedeemDialog({
     try {
       const resp = await invoke<RedeemResponse>('native_api_redeem', {
         baseUrl,
+        proxy,
         code: code.trim(),
         email: email.trim() || undefined,
         renewKey: renew ? currentKey : undefined,
@@ -484,8 +674,23 @@ function RedeemDialog({
               <Label>{t('bots.api.redeem_renew')}</Label>
               <span className="text-xs text-muted-foreground">{t('bots.api.redeem_renew_hint')}</span>
             </div>
-            <Switch checked={renew} onCheckedChange={setRenew} disabled={currentKey.trim() === ''} />
+            <Switch
+              checked={renew}
+              onCheckedChange={setRenewChoice}
+              disabled={currentKey.trim() === ''}
+            />
           </div>
+          {renew && (
+            <div className="flex items-start gap-2 rounded-md border border-primary/40 bg-primary/5 p-2">
+              <Info className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+              <span className="text-xs">
+                {t('bots.api.redeem_renew_active', {
+                  last4: currentKey.trim().slice(-4),
+                  until: keyStatus?.expires_at ?? '—',
+                })}
+              </span>
+            </div>
+          )}
           {!renew && (
             <div className="grid gap-1.5">
               <Label>{t('bots.api.redeem_email')}</Label>

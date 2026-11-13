@@ -153,8 +153,8 @@ https://github.com/user-attachments/assets/d5bc6ff6-6560-4365-ae55-660c9a522790
 | Platform | 4-Player | 3-Player | AutoPlay |
 |---|:---:|:---:|:---:|
 | **Mahjong Soul (Majsoul)** | &check; | &check; | &check; |
-| **Tenhou** | &check; | &check; | &cross; |
-| **Riichi City** | &check; | &check; | &cross; |
+| **Tenhou** | &check; | &check; | &check; |
+| **Riichi City** | &check; | &check; | &check; |
 | **Amatsuki** | (planned) | (planned) | &cross; |
 
 ---
@@ -200,6 +200,20 @@ System-wide proxy with a self-signed root CA at `./ca/`:
    Health probe: `GET /ping` → `pong`.
 3. On Windows, [Proxifier](https://www.proxifier.com/) is the usual
    way to redirect a specific application to the proxy.
+4. **Exclude loopback from that redirection.** Send `localhost`,
+   `127.0.0.1` and `::1` direct, never through Akagi.
+
+> [!IMPORTANT]
+> Step 4 is not optional. Games talk to themselves over loopback for
+> internal bookkeeping, and a redirector rule that matches the game for
+> *any* target host will sweep those sockets into Akagi too. Akagi refuses
+> them (you will see a `refusing CONNECT to loopback` warning in the log),
+> but the game may still misbehave — so exclude loopback at the source.
+>
+> In Proxifier: **Profile → Proxification Rules**, enable the built-in
+> **Localhost** rule (Action: *Direct*) and drag it **above** your game
+> rule. Order matters — Proxifier takes the first rule that matches, so a
+> Localhost rule sitting below the game rule never fires.
 
 ---
 
@@ -231,6 +245,15 @@ Three ways:
 - **Redeem code** — turn a prepaid code into a key, or add time to the key you
   already hold.
 - Ask in the [Discord server](https://discord.gg/Z2wjXUK8bN).
+
+#### Request timeout
+
+Each move is fetched from the server with a **request timeout** (default
+**3000 ms**, adjustable in the cloud-inference settings, bounded to 500–10000 ms).
+If a response doesn't arrive in time, that turn falls back to the offline local
+model. Raise it to tolerate a slower server or connection; lower it to give up
+sooner. Note that a riichi costs two requests (declare, then discard) within one
+turn, so very high values risk overrunning the game's turn timer.
 
 ### Per-mode bots
 
@@ -335,6 +358,10 @@ Useful when debugging a bot or a bridge issue.
   running: `curl http://127.0.0.1:23410/ping` should reply `pong`.
   Check your proxy redirector (Proxifier / system proxy) is sending
   the game client to the right host:port.
+- **Game hangs on the loading screen in MITM mode.** Your redirector is
+  probably proxying the game's loopback traffic. Look for
+  `refusing CONNECT to loopback` in the log, then exclude `localhost`,
+  `127.0.0.1` and `::1` — see step 4 of the MITM setup above.
 - **Capture not working in Chromium mode.** Detect did not find your
   browser. Set `capture.chromium.executable` manually in Settings or
   `config.toml`. If the launched browser starts but no frames flow,
@@ -348,6 +375,13 @@ Useful when debugging a bot or a bridge issue.
   "couldn't terminate the browser already using profile …" — close it
   manually and click Restart. Running two Akagi instances against the
   same profile is unsupported.
+- **Tenhou reconnected in the middle of a hand.** Tenhou's rejoin message
+  is a snapshot of the table, not a replay, so Akagi cannot rebuild the
+  hand in progress. It shows a "rejoined mid-hand" toast and pauses
+  analysis and autoplay until the next hand starts; from there on the
+  game is tracked normally. A game rejoined this way is not saved to
+  History, since Akagi never saw the hands before the drop and a partial
+  record would skew the statistics.
 - **Bot crashed mid-game.** The Inspector tab shows the last frame the
   bot saw before dying; attach it to the bug report.
 - **Wrong bot picked for a 3-player game.** Check `bot.active_3p` in
@@ -371,14 +405,13 @@ Done in alpha.8:
 - [x] Bot install from a GitHub release or a local ZIP file
 - [x] Chromium capture mode (no CA trust needed)
 - [x] **Custom themes** (frontend theming hooks)
-- [x] **AutoPlay** (Mahjong Soul first; the bot drives the table
+- [x] **AutoPlay** (Mahjong Soul and Tenhou; the bot drives the table
       autonomously)
 
 Planned:
 
 - [ ] **Amatsuki** platform support
 - [ ] **Refine Frontend** — tile layout, animations, accessibility
-- [ ] **Tenhou autoplay**
 
 Detailed bug tracking lives in
 [GitHub Issues](https://github.com/shinkuan/Akagi/issues).
@@ -416,8 +449,10 @@ truth for channel types.
 talks to the backend over push events (`mjai-event`, `bot-response`,
 `bot-status`, …) and a set of pull commands, both documented in
 [`src/ipc/README.md`](./src/ipc/README.md). With AutoPlay on, the
-`autoplay` manager consumes the bot's decisions and clicks the table
-through the Chromium capture backend (CDP).
+`autoplay` manager consumes the bot's decisions and performs them
+through the Chromium capture backend (CDP) — clicking the table on
+Mahjong Soul, or sending the action over the game's own connection on
+Tenhou, whose client protocol is plain enough to speak directly.
 
 ## Tech Stack
 
@@ -445,7 +480,7 @@ through the Chromium capture backend (CDP).
 .
 ├── src/
 │   ├── analysis/      Shanten / waits / agari-rate / risk / discard search
-│   ├── autoplay/      Bot decisions → table clicks via CDP (AutoPlay)
+│   ├── autoplay/      Bot decisions → table clicks (Mahjong Soul) or protocol frames (Tenhou), via CDP
 │   ├── bot/           Bot manager: built-in bot, cloud API client, mjai subprocess runner
 │   ├── bridge/        Per-platform protocol → MjaiEvent
 │   │   ├── majsoul/   Mahjong Soul (liqi protobuf)
@@ -594,8 +629,15 @@ on tag push (`v3.*`) or manual dispatch. One portable zip per target:
 | OS runner | Target | Artifact |
 |---|---|---|
 | `ubuntu-22.04` (glibc 2.35) | `x86_64-unknown-linux-gnu` | `akagi-<version>-linux-x64.zip` |
-| `macos-14` | `aarch64-apple-darwin` | `akagi-<version>-macos-arm64.zip` |
+| `macos-15` | `aarch64-apple-darwin` | `akagi-<version>-macos-arm64.zip` |
 | `windows-latest` | `x86_64-pc-windows-msvc` | `akagi-<version>-windows-x64.zip` |
+
+Repository admins can build the current head commit of an open PR by posting
+an exact `/build-artifacts` comment on that PR. The
+[`pr-build.yml`](./.github/workflows/pr-build.yml) workflow replies with links
+to the three portable artifacts when the build finishes; artifacts are retained
+for 14 days. Comments from users without repository admin permission are
+ignored.
 
 Each zip ships `python-build-standalone` 3.12 + `uv` next to the
 binary, so bots run without a system Python install.

@@ -59,6 +59,75 @@ CDP frame event   ─┘
 `FlowBridges<K>` is in `flow.rs`; both backends use it identically.
 Lazy create on first frame, ref-count clean-up on close.
 
+## HTTP capture
+
+Both backends record the HTTP traffic they intercept, not just WebSocket
+frames. Before this, everything except WS was discarded, which hid the
+game's own HTTP entirely — route topology, version and CDN endpoints, and
+the analytics beacons through which the client reports on itself.
+
+`http.rs` holds the policy both backends share: what to keep, what to
+skip, and how to say so. Nothing in it understands any protocol above
+HTTP; meaning is added separately by `crate::inspector::annotate`.
+
+Two rules are load-bearing:
+
+- **A skipped body records why.** A timeline that looks the same whether a
+  body was empty or merely dropped is the blind spot this exists to
+  remove.
+- **Bodies are decided from headers alone**, before a byte is read, so a
+  multi-megabyte asset is never buffered and a chunked response never
+  stalls the forward. Akagi forwards traffic untouched; buffering is the
+  one thing that could change that.
+
+### What the two backends see differently
+
+| | MITM | Chromium |
+|---|---|---|
+| volume | a whole session is ~23 requests | every page subresource; static assets are filtered out by default |
+| bodies | buffered within the cap | not captured — needs a separate `Network.getResponseBody` round-trip per request |
+| pairing | best-effort FIFO per connection; unpaired under HTTP/2 (no stream id in hudsucker's context) | exact — CDP hands out a real request id |
+| blind spots | raw-tunneled `CONNECT` (recorded as an `akagi_bypass` annotation); cleartext non-`GET` inside a tunnel | anything the page does not route through the network stack |
+
+Configured under `[capture.http]`. `record_all` is **off** by default:
+full capture puts access tokens and cookies in the session file and
+nothing is redacted, so the default keeps only exchanges a recognizer
+understood. See `src/config/README.md`.
+
+## Telemetry blocking
+
+The game clients report on themselves through Aliyun SLS web-tracking
+beacons. Both backends keep them from leaving the machine, each under its
+own switch (default **on**), and both decide what counts as telemetry with
+`telemetry.rs::is_sls_host` — the `log.aliyuncs.com` service domain:
+
+- **MITM** — `[proxy] block_telemetry`. The proxy refuses the `CONNECT` to
+  the host. See `src/proxy/README.md`.
+- **Chromium** — `[capture.chromium] block_telemetry`. `cdp.rs` arms the
+  `Fetch` domain on every page with request-stage patterns for the domain
+  (one `Fetch.enable` alongside the Tenhou client rewrite, since each call
+  replaces the patterns of the last) and fails each paused request whose
+  host passes `is_sls_host` as `BlockedByClient` — the
+  `net::ERR_BLOCKED_BY_CLIENT` an ad blocker produces. Anything the globs
+  catch that is not an SLS host is continued untouched.
+
+Page-scoped interception covers more than the page's own requests: the
+CORS preflight the beacon XHR triggers (which carries the whole payload in
+its URL) and requests from the page's dedicated workers are paused too.
+Each blocked request is logged under `akagi::capture::http`, and the
+page's own requests go on the timeline with an `akagi_blocked` annotation
+next to their `sls_beacon` one. Worker requests are blocked but do not
+appear on the timeline — page-scoped `Network` events do not report them.
+
+The window it cannot cover is a tab's first second: interception is armed
+when the page poll attaches to the tab, and requests made before that go
+out. The game fires its first beacon at login, well after.
+
+`tests/chromium_telemetry_block.rs` drives the real CDP loop against a
+headless browser and asserts no beacon — preflight, image, `sendBeacon`,
+worker — reaches the wire. It needs a browser, so it is `#[ignore]`d; run it
+with `cargo test --test chromium_telemetry_block -- --ignored`.
+
 ## Path conventions
 
 For data the backend writes at runtime (Chromium profile, downloaded

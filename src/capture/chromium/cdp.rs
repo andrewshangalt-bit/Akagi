@@ -19,20 +19,36 @@
 //! Service-worker WebSockets are not subscribed in v1 — Majsoul uses
 //! page-scoped WS today. If real-world testing shows otherwise, expand
 //! the polling to include `browser.targets()` and filter on type.
+//!
+//! Request interception (the `Fetch` domain) is armed per page too, and
+//! does two jobs: it rewrites the Tenhou client on its way in, and — with
+//! `[capture.chromium] block_telemetry` on — fails the game's Aliyun SLS
+//! telemetry before it leaves the browser. A page-scoped `Fetch.enable`
+//! also pauses the page's CORS preflights and its dedicated workers'
+//! requests, so a beacon has no side door. A tab's requests made before
+//! it is attached (under a second, by the poll interval) are not covered;
+//! the game fires its first beacon at login, well after that.
 
 use crate::autoplay::AutoplayContext;
 use crate::bridge::Direction;
 use crate::capture::flow::{slugify, FlowBridges};
-use crate::event_bus::MjaiBus;
+use crate::capture::telemetry;
+use crate::config::HttpCaptureConfig;
+use crate::event_bus::{MjaiBus, NotifyBus};
+use crate::inspector::annotate::{self, RequestView};
 use crate::inspector::InspectorWriter;
-use crate::schema::{FrameDirection, FrameRaw, InspectorEntry};
+use crate::schema::{
+    CaptureSource, FrameDirection, FrameRaw, HttpAnnotation, HttpBody, HttpExchange, HttpHeader,
+    HttpPhase, InspectorEntry,
+};
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use chromiumoxide::page::Page;
 use chromiumoxide::{
     cdp::browser_protocol::network::{
-        EnableParams as NetworkEnableParams, EventWebSocketClosed, EventWebSocketCreated,
-        EventWebSocketFrameReceived, EventWebSocketFrameSent,
+        EnableParams as NetworkEnableParams, EventRequestWillBeSent, EventResponseReceived,
+        EventWebSocketClosed, EventWebSocketCreated, EventWebSocketFrameReceived,
+        EventWebSocketFrameSent, Headers, ResourceType,
     },
     Browser,
 };
@@ -106,10 +122,27 @@ pub fn diff_pages(prev: &HashSet<String>, current: &HashSet<String>) -> (Vec<Str
     (adds, removes)
 }
 
+/// Decide whether the autoplay page handle — currently owned by tab
+/// `owner` (its `TargetId`, if any) — must be cleared when the page-poll
+/// loop reaps the `removed` tabs this tick.
+///
+/// The handle tracks the browser **tab**, not any single WebSocket, so it
+/// is cleared only when its owning tab disappears from the snapshot. This
+/// is the crux of the "autoplay silently stops mid-game" fix: Majsoul
+/// opens and closes many short-lived Route-probe / lobby-reconnect sockets
+/// to `*.maj-soul.com` while a game runs on a separate `game-gateway`
+/// socket, and those socket closures must **not** drop the handle. Pure so
+/// the decision is unit-testable without a live `Page`.
+pub fn page_handle_cleared_by_removal(owner: Option<&str>, removed: &[String]) -> bool {
+    matches!(owner, Some(o) if removed.iter().any(|r| r == o))
+}
+
 /// Hosts whose WebSocket creation hands the page handle to autoplay.
 /// `maj-soul.com` covers en/cn/jp portals; `mahjongsoul.com` is the
-/// Yostar mirror.
-const AUTOPLAY_HOST_HINTS: &[&str] = &["maj-soul.com", "mahjongsoul.com"];
+/// Yostar mirror. `tenhou.net` and `mjv.jp` are Tenhou's portal and its
+/// game gateway respectively — Tenhou autoplay speaks on the page's own
+/// socket, so it needs the same page handle.
+const AUTOPLAY_HOST_HINTS: &[&str] = &["maj-soul.com", "mahjongsoul.com", "tenhou.net", "mjv.jp"];
 
 fn is_autoplay_target_url(ws_url: &str) -> bool {
     AUTOPLAY_HOST_HINTS.iter().any(|h| ws_url.contains(h))
@@ -123,12 +156,19 @@ fn is_autoplay_target_url(ws_url: &str) -> bool {
 /// feature is wired (`AppState.autoplay_context`). On Majsoul WS open
 /// we publish the page handle into it; autoplay reads it back to dispatch
 /// `Input.dispatchMouseEvent`. Passing `None` makes the loop bridge-only.
+///
+/// `block_telemetry` arms the telemetry block on every page attached —
+/// see [`interception_patterns`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     endpoint: &str,
     bridges: Arc<FlowBridges<FlowKey>>,
     mjai_bus: MjaiBus,
     inspector: InspectorWriter,
     autoplay: Option<Arc<AutoplayContext>>,
+    http_cfg: HttpCaptureConfig,
+    notify: NotifyBus,
+    block_telemetry: bool,
 ) -> Result<()> {
     info!("CDP connecting to {endpoint}");
     let (browser_owned, mut handler) = Browser::connect(endpoint)
@@ -172,10 +212,31 @@ pub async fn run(
 
             // Reap closed tabs first so we don't leak resources during
             // long sessions where users open + close many tabs.
-            for id in removes {
-                if let Some(h) = subscribed.remove(&id) {
+            for id in &removes {
+                if let Some(h) = subscribed.remove(id) {
                     h.abort();
                     debug!("CDP: dropped subscription for closed target {id}");
+                }
+            }
+
+            // The autoplay page handle tracks the browser *tab*, not any
+            // single WebSocket, so it is cleared here — when its owning tab
+            // is actually gone — rather than on `webSocketClosed`. Majsoul
+            // opens and closes many short-lived Route-probe / lobby-reconnect
+            // sockets to *.maj-soul.com while a game runs on a separate
+            // game-gateway socket; clearing the handle on those closes was
+            // silently stopping autoplay mid-game.
+            if let (Some(ctx), false) = (&autoplay, removes.is_empty()) {
+                // Hold the write lock across the check + clear so a
+                // concurrent rebind from another tab's task can't slip
+                // between reading the owner and nulling the handle.
+                let mut guard = ctx.page.write().await;
+                let owner = guard.as_ref().map(|p| p.target_id().inner().clone());
+                if page_handle_cleared_by_removal(owner.as_deref(), &removes) {
+                    *guard = None;
+                    drop(guard);
+                    *ctx.canvas_rect.write().await = None;
+                    info!("autoplay: page handle cleared — owning Majsoul tab closed");
                 }
             }
 
@@ -192,6 +253,9 @@ pub async fn run(
                     mjai_bus.clone(),
                     inspector.clone(),
                     autoplay.clone(),
+                    http_cfg.clone(),
+                    notify.clone(),
+                    block_telemetry,
                 )
                 .await
                 {
@@ -224,9 +288,282 @@ pub async fn run(
     Err(anyhow!("CDP loop terminated"))
 }
 
+/// URL of the script that carries the Tenhou client.
+///
+/// Versioned (`/4/1141.js`, reached through a redirect from `latest.js`), so
+/// the pattern matches by shape rather than by version.
+const TENHOU_CLIENT_URL_PATTERN: &str = "*tenhou.net/4/*.js";
+
+/// URL patterns that pause the game's telemetry: every request to the
+/// Aliyun SLS service domain, on the default port or any other.
+///
+/// Globs, so they also catch the odd URL that merely *mentions* the domain
+/// (in a query string, or a host like `catalog.aliyuncs.com`);
+/// [`is_telemetry_url`] makes the final call on each paused request.
+const TELEMETRY_URL_PATTERNS: &[&str] = &["*log.aliyuncs.com/*", "*log.aliyuncs.com:*"];
+
+/// What `Fetch.enable` pauses on a page.
+///
+/// - The Tenhou client script, at the *response* stage — we want its
+///   bytes, to rewrite it so its handler registry is exposed.
+/// - With `block_telemetry`, the telemetry patterns at the *request*
+///   stage — the beacon must not leave at all.
+///
+/// One list, because each `Fetch.enable` replaces the patterns of the
+/// last. The stages are also what tells the paused events apart; see
+/// [`is_request_stage`].
+fn interception_patterns(
+    block_telemetry: bool,
+) -> Vec<chromiumoxide::cdp::browser_protocol::fetch::RequestPattern> {
+    use chromiumoxide::cdp::browser_protocol::fetch::{RequestPattern, RequestStage};
+    let pattern = |url: &str, stage| RequestPattern {
+        url_pattern: Some(url.to_string()),
+        resource_type: None,
+        request_stage: Some(stage),
+    };
+    let mut patterns = vec![pattern(TENHOU_CLIENT_URL_PATTERN, RequestStage::Response)];
+    if block_telemetry {
+        patterns.extend(
+            TELEMETRY_URL_PATTERNS
+                .iter()
+                .map(|url| pattern(url, RequestStage::Request)),
+        );
+    }
+    patterns
+}
+
+/// Arm request interception on the page. See [`interception_patterns`].
+async fn enable_interception(page: &Page, block_telemetry: bool) -> Result<()> {
+    use chromiumoxide::cdp::browser_protocol::fetch::EnableParams;
+    let params = EnableParams {
+        patterns: Some(interception_patterns(block_telemetry)),
+        handle_auth_requests: None,
+    };
+    page.execute(params).await.context("Fetch.enable")?;
+    Ok(())
+}
+
+/// `true` when a paused request has not been sent yet. Per the protocol, a
+/// response-stage pause is the one carrying `responseStatusCode` or
+/// `responseErrorReason`; anything else is paused at the request stage.
+fn is_request_stage(ev: &chromiumoxide::cdp::browser_protocol::fetch::EventRequestPaused) -> bool {
+    ev.response_status_code.is_none() && ev.response_error_reason.is_none()
+}
+
+/// `true` for a URL whose host is the Aliyun SLS service domain — what the
+/// telemetry block fails.
+fn is_telemetry_url(url: &str) -> bool {
+    telemetry::is_sls_host(&host_of(url))
+}
+
+/// Settle a request paused at the request stage. Only the telemetry
+/// patterns pause there, so this either fails a beacon or — for a URL the
+/// globs caught whose host is not SLS — lets it through untouched.
+///
+/// Failed as `BlockedByClient`: the page sees `net::ERR_BLOCKED_BY_CLIENT`,
+/// the same error an ad blocker produces for this host.
+async fn settle_paused_request(
+    page: &Page,
+    request_id: chromiumoxide::cdp::browser_protocol::fetch::RequestId,
+    method: &str,
+    url: &str,
+    blocking: bool,
+) {
+    use chromiumoxide::cdp::browser_protocol::fetch::{ContinueRequestParams, FailRequestParams};
+    use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
+
+    if blocking && is_telemetry_url(url) {
+        // The query string is the beacon's payload (device and account
+        // identifiers); keep it out of the log, which users share.
+        let shown = url.split(['?', '#']).next().unwrap_or(url);
+        match page
+            .execute(FailRequestParams::new(
+                request_id,
+                ErrorReason::BlockedByClient,
+            ))
+            .await
+        {
+            Ok(_) => info!(
+                target: "akagi::capture::http",
+                "blocked telemetry beacon: {method} {shown}",
+            ),
+            // Still paused, so still not sent; it dies with the page.
+            Err(e) => warn!("CDP: could not fail telemetry request {method} {shown}: {e:#}"),
+        }
+        return;
+    }
+    let _ = page.execute(ContinueRequestParams::new(request_id)).await;
+}
+
+/// The timeline's mark on a request the telemetry block failed. Kept
+/// alongside the beacon's own annotation, as on the MITM leg: an announced
+/// gap is not a blind spot.
+fn blocked_annotation() -> HttpAnnotation {
+    HttpAnnotation {
+        kind: "akagi_blocked".to_string(),
+        summary: "telemetry blocked in the browser — never sent".to_string(),
+        data: serde_json::json!({
+            "reason": "Aliyun SLS web-tracking request failed as net::ERR_BLOCKED_BY_CLIENT \
+                       before it left the browser; many ad blockers block this host too, \
+                       so a missing beacon is not a signal",
+        }),
+    }
+}
+
+/// Reload the page if its client script slipped past the interceptor.
+///
+/// Attaching is racy by construction: the browser opens on the game URL and
+/// we subscribe afterwards, so the client script is usually fetched — or
+/// served from disk cache — before `Fetch.enable` takes effect. The
+/// interceptor is then armed for a request that has already happened.
+///
+/// Reloading past the cache puts the script back through it. Done once, at
+/// attach, so it lands on the lobby rather than mid-game; a page that already
+/// carries the door is left alone, which is what keeps this from looping.
+async fn reload_if_uninstrumented(page: &Page) -> Result<()> {
+    use chromiumoxide::cdp::browser_protocol::page::ReloadParams;
+
+    let expr = format!(
+        "(()=>{{try{{return !!window.{} || !/tenhou\\.net/.test(location.host);}}\
+          catch(e){{return true}}}})()",
+        crate::autoplay::tenhou::inject::EXPORT_GLOBAL
+    );
+    let done = page
+        .evaluate(expr)
+        .await
+        .ok()
+        .and_then(|r| r.value().and_then(|v| v.as_bool()))
+        .unwrap_or(true);
+    if done {
+        return Ok(());
+    }
+    info!("CDP: re-loading the Tenhou client so it passes through the interceptor");
+    let params = ReloadParams::builder().ignore_cache(true).build();
+    page.execute(params).await.context("Page.reload")?;
+    Ok(())
+}
+
+/// Rewrite one paused response and let it through.
+///
+/// Every outcome continues the request — instrumentation that fails must cost
+/// the discard path, never the page. A derivation failure is surfaced to the
+/// user because it means the client changed shape and the pattern that finds
+/// its handler registry needs revisiting; that is a report worth having.
+async fn rewrite_paused_script(
+    page: &Page,
+    notify: &NotifyBus,
+    request_id: chromiumoxide::cdp::browser_protocol::fetch::RequestId,
+    url: &str,
+) {
+    use crate::autoplay::tenhou::inject;
+    use chromiumoxide::cdp::browser_protocol::fetch::{
+        ContinueRequestParams, FulfillRequestParams, GetResponseBodyParams,
+    };
+
+    let passthrough = |id: chromiumoxide::cdp::browser_protocol::fetch::RequestId| {
+        ContinueRequestParams::builder().request_id(id).build().ok()
+    };
+
+    let body = match page
+        .execute(GetResponseBodyParams::new(request_id.clone()))
+        .await
+    {
+        Ok(r) => {
+            let inner = r.result;
+            if inner.base64_encoded {
+                base64::engine::general_purpose::STANDARD
+                    .decode(inner.body.as_bytes())
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+            } else {
+                Some(inner.body)
+            }
+        }
+        Err(e) => {
+            // Redirects and other bodiless responses land here. The pattern
+            // is deliberately loose enough to catch the client whatever
+            // version it is served under, so it also catches its neighbours;
+            // that is expected, not a fault.
+            debug!("CDP: no body for {url}: {e:#}");
+            None
+        }
+    };
+
+    let rewritten = match body.as_deref().map(inject::rewrite_client) {
+        Some(Ok(js)) => Some(js),
+        // Not the client at all — the URL pattern matches its neighbours
+        // too (`inflate_min.js`, the `latest.js` redirect). Nothing to say.
+        Some(Err(inject::InjectError::NoDiscardHandler)) => {
+            debug!("CDP: {url} is not the Tenhou client; passing through");
+            None
+        }
+        // It *is* the client — it registers a discard handler — but the
+        // registry could not be recovered. That means the client changed
+        // shape, which is the one failure here that cannot be diagnosed from
+        // logs alone, so ask for a report.
+        Some(Err(e)) => {
+            warn!("CDP: cannot instrument the Tenhou client ({url}): {e}");
+            let _ = notify.send(
+                crate::schema::Notification::warn("Tenhou autoplay unavailable")
+                    .body(format!(
+                        "This build of the Tenhou client could not be instrumented ({e}).                          Discards will not be played. Please report this so the client                          pattern can be updated."
+                    ))
+                    .sticky(),
+            );
+            None
+        }
+        None => None,
+    };
+
+    let sent = match rewritten {
+        Some(js) => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(js.as_bytes());
+            match FulfillRequestParams::builder()
+                .request_id(request_id.clone())
+                .response_code(200)
+                // A fulfilled response carries none of the original headers.
+                // Today the browser sniffs the missing type and executes
+                // anyway, but one `X-Content-Type-Options: nosniff` on
+                // tenhou.net's side would turn that into a blocked script —
+                // so say what it is.
+                .response_header(
+                    chromiumoxide::cdp::browser_protocol::fetch::HeaderEntry::new(
+                        "Content-Type",
+                        "text/javascript",
+                    ),
+                )
+                .body(encoded)
+                .build()
+            {
+                Ok(p) => {
+                    if let Err(e) = page.execute(p).await {
+                        warn!("CDP: could not serve the instrumented client: {e:#}");
+                        false
+                    } else {
+                        info!("CDP: Tenhou client instrumented ({url})");
+                        true
+                    }
+                }
+                Err(e) => {
+                    warn!("CDP: could not build the instrumented response: {e}");
+                    false
+                }
+            }
+        }
+        None => false,
+    };
+
+    if !sent {
+        if let Some(p) = passthrough(request_id) {
+            let _ = page.execute(p).await;
+        }
+    }
+}
+
 /// Enable Network on the page, subscribe to the four WS events, and
 /// spawn a routing task. Returns the task handle so the poll loop can
 /// abort it when the tab closes.
+#[allow(clippy::too_many_arguments)]
 async fn attach_page(
     page: Page,
     target_id: String,
@@ -234,10 +571,57 @@ async fn attach_page(
     mjai_bus: MjaiBus,
     inspector: InspectorWriter,
     autoplay: Option<Arc<AutoplayContext>>,
+    http_cfg: HttpCaptureConfig,
+    notify: NotifyBus,
+    block_telemetry: bool,
 ) -> Result<JoinHandle<()>> {
     page.execute(NetworkEnableParams::default())
         .await
         .context("Network.enable")?;
+    // The pause listener has to exist before `Fetch.enable` arms the
+    // interceptor: a request paused with no listener yet is a request nobody
+    // ever continues, and the page hangs on it. The stream buffers
+    // (unbounded) until the routing task below starts polling, so
+    // subscribing early costs nothing.
+    let mut on_paused = page
+        .event_listener::<chromiumoxide::cdp::browser_protocol::fetch::EventRequestPaused>()
+        .await
+        .context("subscribe requestPaused")?;
+    // Every HTTP request the page makes, so we can pick the game's
+    // analytics beacons out of it. `Network.enable` above already turns
+    // this event on; the filtering is ours, in the select arm. Subscribed
+    // before `Fetch.enable` too: a beacon the interceptor fails still fires
+    // `requestWillBeSent`, and that event is where its block is recorded.
+    let mut on_request = page
+        .event_listener::<EventRequestWillBeSent>()
+        .await
+        .context("subscribe requestWillBeSent")?;
+    // Instrument the Tenhou client on its way in, and fail the game's
+    // telemetry before it leaves. Scoped to those patterns so nothing else
+    // on the page is paused; a failure to enable is logged and the session
+    // continues without either. `blocking` is whether telemetry really is
+    // being failed here — the timeline must not claim a block that never
+    // happened.
+    let blocking = match enable_interception(&page, block_telemetry).await {
+        Ok(()) => {
+            if let Err(e) = reload_if_uninstrumented(&page).await {
+                warn!("CDP: could not re-load the client for instrumentation: {e:#}");
+            }
+            block_telemetry
+        }
+        Err(e) => {
+            warn!(
+                "CDP: request interception unavailable on target {target_id} — no client \
+                 instrumentation{}: {e:#}",
+                if block_telemetry {
+                    ", telemetry NOT blocked"
+                } else {
+                    ""
+                },
+            );
+            false
+        }
+    };
     let mut on_created = page
         .event_listener::<EventWebSocketCreated>()
         .await
@@ -254,14 +638,29 @@ async fn attach_page(
         .event_listener::<EventWebSocketClosed>()
         .await
         .context("subscribe webSocketClosed")?;
+    let mut on_response = page
+        .event_listener::<EventResponseReceived>()
+        .await
+        .context("subscribe responseReceived")?;
 
     let handle = tokio::spawn(async move {
-        // Track the most recent autoplay-target request id for this page,
-        // so we know which WS close to react to when clearing the page
-        // handle from the autoplay context.
-        let mut autoplay_request_id: Option<String> = None;
         loop {
             tokio::select! {
+                Some(ev) = on_paused.next() => {
+                    let url = ev.request.url.clone();
+                    if is_request_stage(&ev) {
+                        settle_paused_request(
+                            &page,
+                            ev.request_id.clone(),
+                            &ev.request.method,
+                            &url,
+                            blocking,
+                        )
+                        .await;
+                    } else {
+                        rewrite_paused_script(&page, &notify, ev.request_id.clone(), &url).await;
+                    }
+                }
                 Some(ev) = on_created.next() => {
                     let key = FlowKey {
                         target: target_id.clone(),
@@ -274,22 +673,43 @@ async fn attach_page(
 
                     // If this is the platform's WS (Majsoul), capture
                     // the owning page so autoplay can dispatch input
-                    // into it. Multi-tab user: most-recent wins, per
-                    // the plan.
+                    // into it. The handle is bound to the *tab* and lives
+                    // until the tab closes (see the poll loop); a new WS on
+                    // the same tab just refreshes it. Multi-tab user:
+                    // most-recent wins, per the plan.
                     if let Some(ctx) = &autoplay {
                         if is_autoplay_target_url(&ev.url) {
                             let mut guard = ctx.page.write().await;
-                            if guard.is_some() {
-                                warn!(
-                                    "autoplay: replacing page handle on new WS for target {target_id}"
+                            let prev_target =
+                                guard.as_ref().map(|p| p.target_id().inner().clone());
+                            let same_tab = prev_target.as_deref() == Some(target_id.as_str());
+                            *guard = Some(page.clone());
+                            drop(guard);
+                            if same_tab {
+                                // Majsoul re-opens sockets (Route probes,
+                                // lobby reconnects) constantly on the same
+                                // tab; refreshing the handle is a no-op and
+                                // must not spam warnings.
+                                debug!(
+                                    "autoplay: page handle refreshed on new WS for target {target_id} ({})",
+                                    ev.url
+                                );
+                            } else {
+                                if let Some(prev) = &prev_target {
+                                    warn!(
+                                        "autoplay: page handle moving from tab {prev} to {target_id}"
+                                    );
+                                    // The cached canvas rect belonged to the
+                                    // old tab; a different tab may have
+                                    // different geometry, so drop it and let
+                                    // the manager re-query against the new page.
+                                    *ctx.canvas_rect.write().await = None;
+                                }
+                                info!(
+                                    "autoplay: page handle bound to target {target_id} via WS {}",
+                                    ev.url
                                 );
                             }
-                            *guard = Some(page.clone());
-                            autoplay_request_id = Some(ev.request_id.inner().clone());
-                            info!(
-                                "autoplay: page handle bound to target {target_id} via WS {}",
-                                ev.url
-                            );
                         }
                     }
                 }
@@ -371,22 +791,149 @@ async fn attach_page(
                     let bridge = bridges.acquire(key.clone(), "ws", "ws frame");
                     bridges.release(&key, bridge);
 
-                    // If this is the autoplay-target WS, drop our hold
-                    // on the page handle. The next reconnection (game
-                    // restart, network blip) re-binds it from `on_created`.
-                    if let (Some(ctx), Some(req)) = (&autoplay, &autoplay_request_id) {
-                        if *req == *ev.request_id.inner() {
-                            *ctx.page.write().await = None;
-                            autoplay_request_id = None;
-                            debug!("autoplay: page handle cleared on WS close for target {target_id}");
-                        }
+                    // NB: we deliberately do NOT touch the autoplay page
+                    // handle here. Majsoul closes short-lived Route-probe /
+                    // lobby-reconnect sockets to *.maj-soul.com throughout a
+                    // game while the real game-gateway socket stays open;
+                    // dropping the handle on those closes silently stopped
+                    // autoplay mid-game. The handle is tied to the tab and
+                    // cleared by the poll loop when the tab itself closes.
+                }
+                Some(ev) = on_request.next() => {
+                    // Fires for every subresource the page loads — the
+                    // asymmetry with the MITM leg, where a whole session
+                    // is a couple of dozen requests. Filter first, and
+                    // keep the recognizers' work off the hot path. A
+                    // request the telemetry block fails is never filtered
+                    // out — an `<img>` beacon is a static asset by type.
+                    if is_static_asset(ev.r#type.as_ref())
+                        && !http_cfg.static_assets
+                        && !(blocking && is_telemetry_url(&ev.request.url))
+                    {
+                        continue;
                     }
+                    let headers = headers_of(&ev.request.headers);
+                    let mut annotations = annotate::annotate_request(&RequestView::new(
+                        &ev.request.method,
+                        &ev.request.url,
+                        &headers,
+                    ));
+                    // `settle_paused_request` fails exactly these, by the
+                    // same test, so the mark is what actually happened.
+                    if blocking && is_telemetry_url(&ev.request.url) {
+                        annotations.push(blocked_annotation());
+                    }
+                    if let Some(a) = annotations.first() {
+                        info!(
+                            target: "akagi::capture::http",
+                            "recognized {} {}", a.kind, a.summary,
+                        );
+                    }
+                    if !http_cfg.record_all && annotations.is_empty() {
+                        continue;
+                    }
+                    inspector.record(InspectorEntry::Http {
+                        ts_ms: Local::now().timestamp_millis(),
+                        source: CaptureSource::Chromium,
+                        exchange: HttpExchange {
+                            // CDP hands out a real request id, so pairing
+                            // here is exact — unlike the MITM leg.
+                            exchange_id: Some(ev.request_id.inner().clone()),
+                            phase: HttpPhase::Request,
+                            method: ev.request.method.clone(),
+                            url: ev.request.url.clone(),
+                            host: host_of(&ev.request.url),
+                            version: String::new(),
+                            status: None,
+                            headers,
+                            body: None,
+                            annotations,
+                        },
+                    });
+                }
+                Some(ev) = on_response.next() => {
+                    if !http_cfg.record_all {
+                        continue;
+                    }
+                    if is_static_asset(Some(&ev.r#type)) && !http_cfg.static_assets {
+                        continue;
+                    }
+                    inspector.record(InspectorEntry::Http {
+                        ts_ms: Local::now().timestamp_millis(),
+                        source: CaptureSource::Chromium,
+                        exchange: HttpExchange {
+                            exchange_id: Some(ev.request_id.inner().clone()),
+                            phase: HttpPhase::Response,
+                            method: String::new(),
+                            url: ev.response.url.clone(),
+                            host: host_of(&ev.response.url),
+                            version: String::new(),
+                            status: Some(ev.response.status as u16),
+                            headers: headers_of(&ev.response.headers),
+                            // Reading a body here costs a separate
+                            // `Network.getResponseBody` round-trip per
+                            // request, which the MITM leg does not need.
+                            // Say so rather than look like there was none.
+                            body: Some(HttpBody {
+                                text: None,
+                                bytes: None,
+                                skipped: Some(
+                                    "not captured on the chromium backend".to_string(),
+                                ),
+                            }),
+                            annotations: Vec::new(),
+                        },
+                    });
                 }
                 else => break,
             }
         }
     });
     Ok(handle)
+}
+
+/// Subresource types that say nothing about the client and would bury
+/// everything else. A WebGL game pulls thousands; the MITM leg never sees
+/// them at all because the game fetches them outside the proxied path.
+fn is_static_asset(kind: Option<&ResourceType>) -> bool {
+    matches!(
+        kind,
+        Some(
+            ResourceType::Image
+                | ResourceType::Font
+                | ResourceType::Media
+                | ResourceType::Stylesheet
+        )
+    )
+}
+
+/// CDP delivers headers as a JSON object, which has no wire order to
+/// preserve — unlike the MITM leg, where order is a real fingerprint.
+/// Sorted so two captures of the same request compare equal.
+fn headers_of(headers: &Headers) -> Vec<HttpHeader> {
+    let Some(map) = headers.inner().as_object() else {
+        return Vec::new();
+    };
+    let mut out: Vec<HttpHeader> = map
+        .iter()
+        .map(|(name, value)| HttpHeader {
+            name: name.clone(),
+            value: match value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            },
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Host of an absolute URL, or empty when it has none (`data:`, `blob:`).
+fn host_of(url: &str) -> String {
+    url.parse::<http::Uri>()
+        .ok()
+        .and_then(|u| u.host().map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// Build a stable flow id for the inspector. Uses just the request id
@@ -477,6 +1024,27 @@ mod tests {
         assert!(removes.is_empty());
     }
 
+    /// Regression: a Majsoul Route-probe / lobby-reconnect socket closing
+    /// must NOT clear the autoplay page handle — that was making autoplay
+    /// silently stop mid-game. The handle is tied to the browser tab, so
+    /// only the owning tab's removal from the page snapshot clears it.
+    #[test]
+    fn page_handle_cleared_only_when_owning_tab_closes() {
+        let owner = Some("TAB_A");
+        // A *different* tab closing (or a WS closing, which never reaches
+        // this predicate at all) leaves our handle intact.
+        assert!(!page_handle_cleared_by_removal(owner, &["TAB_B".into()]));
+        // Nothing reaped this tick — keep the handle.
+        assert!(!page_handle_cleared_by_removal(owner, &[]));
+        // The owning tab itself disappearing is the only trigger.
+        assert!(page_handle_cleared_by_removal(
+            owner,
+            &["TAB_B".into(), "TAB_A".into()]
+        ));
+        // No handle bound → nothing to clear regardless of what closed.
+        assert!(!page_handle_cleared_by_removal(None, &["TAB_A".into()]));
+    }
+
     /// Regression: prior code dropped every non-binary frame, which
     /// silently broke Tenhou capture (Tenhou uses opcode 1 / text).
     #[test]
@@ -516,6 +1084,121 @@ mod tests {
             decode_frame_payload(2, "not base64!@#"),
             FrameDecode::BadBase64
         );
+    }
+
+    /// The Tenhou rewrite is always armed; the telemetry patterns join it
+    /// only when blocking is on, and at the request stage — a beacon paused
+    /// at the response stage would already have been sent.
+    #[test]
+    fn telemetry_patterns_are_armed_at_the_request_stage_only_when_blocking() {
+        use chromiumoxide::cdp::browser_protocol::fetch::RequestStage;
+        let urls = |ps: &[chromiumoxide::cdp::browser_protocol::fetch::RequestPattern],
+                    stage: RequestStage| {
+            ps.iter()
+                .filter(|p| p.request_stage == Some(stage.clone()))
+                .filter_map(|p| p.url_pattern.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let off = interception_patterns(false);
+        assert_eq!(
+            urls(&off, RequestStage::Response),
+            [TENHOU_CLIENT_URL_PATTERN]
+        );
+        assert!(urls(&off, RequestStage::Request).is_empty());
+
+        let on = interception_patterns(true);
+        assert_eq!(
+            urls(&on, RequestStage::Response),
+            [TENHOU_CLIENT_URL_PATTERN]
+        );
+        assert_eq!(urls(&on, RequestStage::Request), TELEMETRY_URL_PATTERNS);
+    }
+
+    /// `Fetch` patterns are globs where `*` spans `/`. Every SLS URL shape
+    /// must be paused by them — anything they miss is never even offered
+    /// to `is_telemetry_url` and goes out unblocked.
+    #[test]
+    fn telemetry_patterns_pause_every_sls_url_shape() {
+        let globs: Vec<globset::GlobMatcher> = TELEMETRY_URL_PATTERNS
+            .iter()
+            .map(|p| {
+                globset::GlobBuilder::new(p)
+                    .literal_separator(false)
+                    .build()
+                    .expect("valid glob")
+                    .compile_matcher()
+            })
+            .collect();
+        for url in [
+            "https://example-client.cn-hongkong.log.aliyuncs.com/logstores/client/track?log_category=login_stats",
+            "http://example-client.cn-hongkong.log.aliyuncs.com/logstores/client/track_ua.gif",
+            "https://log.aliyuncs.com/",
+            "https://example-client.cn-hongkong.log.aliyuncs.com:8443/logstores/client/track",
+        ] {
+            assert!(globs.iter().any(|g| g.is_match(url)), "not paused: {url}");
+        }
+        assert!(!globs
+            .iter()
+            .any(|g| g.is_match("https://game.maj-soul.com/1/")));
+    }
+
+    /// The final call on a paused request is the host, not the glob: a URL
+    /// that merely mentions the domain is let through.
+    #[test]
+    fn only_sls_hosts_count_as_telemetry() {
+        assert!(is_telemetry_url(
+            "https://example-client.cn-hongkong.log.aliyuncs.com/logstores/client/track?log_category=game_status"
+        ));
+        assert!(is_telemetry_url(
+            "https://example-client.cn-hongkong.log.aliyuncs.com:8443/x"
+        ));
+        // The browser leaves `{`, `}` and `|` unescaped in a query; the
+        // parse must still find the host.
+        assert!(is_telemetry_url(
+            "https://example-client.cn-hongkong.log.aliyuncs.com/logstores/client/track?content={%22a%22:|1|}"
+        ));
+
+        assert!(!is_telemetry_url(
+            "https://game.maj-soul.com/1/?next=https://x.log.aliyuncs.com/"
+        ));
+        assert!(!is_telemetry_url("https://catalog.aliyuncs.com/x"));
+        assert!(!is_telemetry_url("https://log.aliyuncs.com.example.com/"));
+        assert!(!is_telemetry_url("data:text/plain,log.aliyuncs.com/"));
+        assert!(!is_telemetry_url("not a url"));
+    }
+
+    /// A response-stage pause (the Tenhou client) must not be mistaken for
+    /// a request-stage one (telemetry), or the client would be failed and
+    /// a beacon "rewritten".
+    #[test]
+    fn paused_stage_is_read_from_the_response_fields() {
+        use chromiumoxide::cdp::browser_protocol::fetch::EventRequestPaused;
+        let paused = |extra: serde_json::Value| -> EventRequestPaused {
+            let mut ev = serde_json::json!({
+                "requestId": "interception-job-1.0",
+                "request": {
+                    "url": "https://example.test/",
+                    "method": "GET",
+                    "headers": {},
+                    "initialPriority": "High",
+                    "referrerPolicy": "strict-origin-when-cross-origin",
+                },
+                "frameId": "FRAME",
+                "resourceType": "Script",
+            });
+            ev.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(ev).expect("valid requestPaused")
+        };
+        assert!(is_request_stage(&paused(serde_json::json!({}))));
+        assert!(!is_request_stage(&paused(
+            serde_json::json!({ "responseStatusCode": 200 })
+        )));
+        assert!(!is_request_stage(&paused(
+            serde_json::json!({ "responseErrorReason": "Failed" })
+        )));
     }
 
     #[test]

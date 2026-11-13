@@ -62,6 +62,15 @@ pub fn calculate_score(
 /// rinshan from `is_rinshan_flag`, ippatsu from `players[actor].ippatsu_cycle`,
 /// chankan from `pending_kan.is_some()` (ron only).
 ///
+/// Known gap: `pending_kan` is never set on the tracker's replay path — only
+/// the live engine sets it, and `native_bot::chankan` deliberately leaves it
+/// unset when it opens the chankan window (nothing would clear it before the
+/// next start_kyoku, so setting it would tag every later ron of the hand as a
+/// chankan). Net effect: a chankan ron's preview under-reports by the chankan
+/// han (and, in the riichi-into-chankan corner, the ippatsu han too — the
+/// tracker's ippatsu patch retires the window on the kakan event before the
+/// chankan check runs; see `tracker.rs`).
+///
 /// `tsumo_first_turn` (tenhou/chiihou) is derived from observable state
 /// rather than `state.is_first_turn` — riichienv-core 0.4.8's mjai-event
 /// handler initializes that flag to `true` on `start_kyoku` and never
@@ -95,6 +104,7 @@ pub fn evaluate_hora_4p(state: &GameState, actor: u8, is_tsumo: bool) -> Option<
         haitei: is_tsumo && state.wall.drawable_count == 0 && !state.is_rinshan_flag,
         houtei: !is_tsumo && state.wall.drawable_count == 0 && !state.is_rinshan_flag,
         rinshan: is_tsumo && state.is_rinshan_flag,
+        // Always false on the replay path — see "Known gap" in the doc above.
         chankan: !is_tsumo && state.pending_kan.is_some(),
         tsumo_first_turn: first_turn,
         player_wind: Wind::from((actor + 4 - state.oya) % 4),
@@ -174,6 +184,7 @@ pub fn evaluate_hora_3p(state: &GameState3P, actor: u8, is_tsumo: bool) -> Optio
         haitei: is_tsumo && state.wall.drawable_count == 0 && !state.is_rinshan_flag,
         houtei: !is_tsumo && state.wall.drawable_count == 0 && !state.is_rinshan_flag,
         rinshan: is_tsumo && state.is_rinshan_flag,
+        // Always false on the replay path — see the 4p variant's doc comment.
         chankan: !is_tsumo && state.pending_kan.is_some(),
         tsumo_first_turn: first_turn,
         player_wind: Wind::from((actor + 3 - state.oya) % 3),
@@ -263,12 +274,25 @@ mod tests {
     /// actually exercise the first-turn path.)
     fn chiitoitsu_state(actor: u8, oya: u8) -> GameState {
         let rule = riichienv_core::rule::GameRule::default_tenhou();
-        let mut s = GameState::new(0, true, None, 0, rule);
+        // Seeded, like `chiitoitsu_state_3p`: `GameState::new` runs
+        // `_initialize_round`, which shuffles a wall and flips dora — none of
+        // which these tests want a say in.
+        let mut s = GameState::new(0, true, Some(42), 0, rule);
         s.oya = oya;
         s.round_wind = 0; // East
         s.honba = 0;
         s.riichi_sticks = 0;
         s.is_first_turn = false;
+
+        // `_initialize_round` also *deals*, which leaves the dealer's first draw
+        // sitting in `drawn_tile`. Every test below supplies its own winning
+        // tile, so that stray one is never wanted — and it is actively harmful:
+        // `evaluate_hora_4p` reads `drawn_tile` as the winning tile, so a dealt
+        // tile that happened to be an 8s completed this fixture's chiitoitsu
+        // wait and made `evaluate_hora_4p_returns_none_when_no_win_tile` fail.
+        // Unseeded, that was a ~3%-per-run coin flip in CI (#194).
+        s.drawn_tile = None;
+        s.last_discard = None;
 
         // 11m 22m 33p 44p 66s 77s + tenpai-on-8s (13 tiles).
         let hand = vec![
@@ -419,6 +443,14 @@ mod tests {
         // Winning shape in hand but `drawn_tile` is None and `last_discard`
         // is None — we can't infer the winning tile.
         let s = chiitoitsu_state(0, 0);
+        // Pin the premise, don't just assume it. This test spent its whole life
+        // asserting a conclusion that rested on a fixture which quietly handed
+        // it a dealt `drawn_tile`; the assertion below only held while that tile
+        // happened not to complete the hand (#194).
+        assert!(
+            s.drawn_tile.is_none() && s.last_discard.is_none(),
+            "the fixture must carry no winning tile, or this test proves nothing"
+        );
         assert!(evaluate_hora_4p(&s, 0, true).is_none());
         assert!(evaluate_hora_4p(&s, 0, false).is_none());
     }
@@ -498,6 +530,7 @@ mod tests {
             aka_flag: None,
             id: Some(0),
             num_players: 4,
+            game_meta: None,
         })
         .unwrap();
         t.handle(&E::StartKyoku {
@@ -520,6 +553,7 @@ mod tests {
                 vec!["?".into(); 13],
             ],
             num_players: 4,
+            catch_up: 0,
         })
         .unwrap();
 
@@ -666,6 +700,13 @@ mod tests {
         s.riichi_sticks = 0;
         s.is_first_turn = false;
         s.wall.dora_indicators.clear();
+
+        // Same trap as the 4p fixture: the deal leaves a tile in `drawn_tile`
+        // that `evaluate_hora_3p` would read as the winning tile. The seed makes
+        // it deterministic rather than harmless — clear it, so a future test can
+        // assert "no win tile" without silently depending on what seed 42 dealt.
+        s.drawn_tile = None;
+        s.last_discard = None;
 
         // 1p 1p 2p 2p 3p 3p 4p 4p 1s 1s S S + 8p (lone — chiitoitsu wait).
         // South pair (not round wind, not the actor's seat wind for any

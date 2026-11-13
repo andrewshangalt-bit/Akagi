@@ -14,24 +14,39 @@ pub mod tile;
 
 use super::{Bridge, Direction, ParseResult};
 use crate::{
+    autoplay::budget::{BudgetSource, SharedTimeBudget, TimeBudget},
     config::Platform,
     logger::{FlowLogger, Session},
-    schema::{mjai::Actor, MjaiEvent},
+    schema::{mjai::Actor, GameMeta, MatchInfo, MjaiEvent},
 };
 use anyhow::{bail, Context, Result};
 use chrono::Local;
 use parser::{LiqiParser, MessageType, ParsedMessage};
 use serde_json::{json, Value as JsonValue};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tile::{compare_pai, ms_to_mjai};
 use tracing::{info, warn};
 
 const METHOD_AUTH_GAME: &str = ".lq.FastTest.authGame";
 const METHOD_ACTION_PROTOTYPE: &str = ".lq.ActionPrototype";
 const METHOD_NOTIFY_GAME_END_RESULT: &str = ".lq.NotifyGameEndResult";
+const METHOD_NOTIFY_GAME_TERMINATE: &str = ".lq.NotifyGameTerminate";
 /// Reconnect replay: both responses carry a `GameRestore { actions[] }` of the
 /// current kyoku. See `handle_game_restore`.
 const METHOD_SYNC_GAME: &str = ".lq.FastTest.syncGame";
+/// The two uplink calls that mean "the client accepted an input": every
+/// discard, call, win and pass goes out as one of them. Watched so autoplay
+/// can tell a click that registered from one the UI swallowed.
+const METHOD_INPUT_OPERATION: &str = ".lq.FastTest.inputOperation";
+const METHOD_INPUT_CHI_PENG_GANG: &str = ".lq.FastTest.inputChiPengGang";
+/// `timeuse` the client stamps on an action it took by itself rather than
+/// on one the player made — a decision window that ran out, or an auto
+/// setting. Observed as exactly this value on both input methods.
+const TIMEUSE_CLIENT_AUTO: u64 = 1_000_000;
 const METHOD_ENTER_GAME: &str = ".lq.FastTest.enterGame";
 const ACTION_NEW_ROUND: &str = "ActionNewRound";
 const ACTION_DEAL_TILE: &str = "ActionDealTile";
@@ -70,16 +85,24 @@ const UNKNOWN_TILE: &str = "?";
 /// Dora-flip scheduling for kan declarations. Mjai distinguishes ankan
 /// (即乗り — dora flips *before* the rinshan tsumo) from kakan/daiminkan
 /// (後乗り — dora flips *after* the rinshan tsumo, just before the next
-/// dahai). Both Akagi-Python and AkagiNG conflate the two and emit dora
-/// at the wrong moment for kakan/daiminkan; this state machine fixes that.
+/// dahai).
+///
+/// On the wire the live server matches this split: an ankan's new marker
+/// arrives with the rinshan `ActionDealTile.doras`, while a kakan /
+/// daiminkan marker is withheld until the kan declarer commits a tile —
+/// it rides the grown `doras` array of that `ActionDiscardTile` (or
+/// `ActionBaBei` in 3p). This state only schedules markers that arrive
+/// *early* (i.e. already present on the rinshan deal, which older
+/// captures suggested for open kans): `PendingAfterRinshan` holds them
+/// back so they still flip just before the commit event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoraTiming {
     /// Ankan just declared. The next `ActionDealTile` carries the new dora
     /// marker — emit `dora` *before* the rinshan `tsumo`.
     PendingBeforeRinshan,
     /// Kakan or daiminkan just declared. The next `ActionDealTile` still
-    /// emits `tsumo` first; the new dora marker is held back and flipped
-    /// just before the next `dahai`.
+    /// emits `tsumo` first; any marker it already carries is held back and
+    /// flipped just before the next `dahai`.
     PendingAfterRinshan,
 }
 
@@ -89,16 +112,24 @@ pub struct MajsoulBridge {
     session: Option<Arc<Session>>,
     mjai_log: Option<Arc<FlowLogger>>,
     account_id: Option<u64>,
+    game_id: Option<u64>,
+    /// Raw `ReqAuthGame.game_uuid` — the paifu identifier, persisted into
+    /// history's `MatchInfo` so the frontend can link to the replay.
+    /// `game_id` above stays the FNV hash used for reconnect detection.
+    game_uuid: Option<String>,
     seat: Option<Actor>,
-    /// Mjai-mapped dora indicators seen so far this kyoku. Used to detect
-    /// new dora markers in subsequent `ActionDealTile.doras`.
+    /// Mjai-mapped dora indicators seen so far this kyoku. Compared
+    /// against the `doras` array that any action payload may carry
+    /// (`ActionDealTile`, `ActionDiscardTile`, `ActionAnGangAddGang`,
+    /// `ActionBaBei`) to detect newly revealed markers.
     doras: Vec<String>,
     /// Pending kan-dora timing, set by meld actions and consumed by
     /// `build_tsumo` / `build_dahai`.
     dora_timing: Option<DoraTiming>,
-    /// Mjai-mapped dora marker held for emission immediately before the
-    /// next `dahai` (kakan / daiminkan flow).
-    deferred_dora: Option<String>,
+    /// Mjai-mapped dora markers held for emission immediately before the
+    /// next commit event — `dahai`, or `kita` in 3p (kakan / daiminkan
+    /// flow).
+    deferred_doras: Vec<String>,
     /// Seat of the actor whose most recent action *revealed* a tile that
     /// another seat could ron — i.e. the legitimate `target` for a hora.
     /// Updated by:
@@ -124,6 +155,23 @@ pub struct MajsoulBridge {
     /// `authGame` response. Defaults to 4 so per-flow code that runs before
     /// auth (none today, but be defensive) sees a sane value.
     num_players: u8,
+    /// Shared slot for the server's per-decision-window time budget
+    /// (`operation.time_fixed` / `time_add`, both ms). `None` when the
+    /// autoplay context isn't wired (MITM path, tests).
+    time_budget: Option<SharedTimeBudget>,
+    /// True while `handle_game_restore` replays historical actions through
+    /// `handle_action_prototype`. Replayed operations must not clobber the
+    /// live budget slot — the last one is committed after the replay with
+    /// `passed_waiting_time` folded in.
+    replaying: bool,
+    /// The budget carried by the most recent replayed action (if its
+    /// operation was addressed to our seat). Committed by
+    /// `handle_game_restore` once the replay finishes.
+    restore_budget: Option<TimeBudget>,
+    /// Counter of the client's own uplink input commands, shared with the
+    /// autoplay manager for click verification (see `autoplay::verify`).
+    /// `None` when the autoplay context isn't wired (MITM path, tests).
+    input_watch: Option<crate::autoplay::verify::SharedInputWatch>,
 }
 
 impl MajsoulBridge {
@@ -134,14 +182,37 @@ impl MajsoulBridge {
             session,
             mjai_log: None,
             account_id: None,
+            game_id: None,
+            game_uuid: None,
             seat: None,
             doras: Vec::new(),
             dora_timing: None,
-            deferred_dora: None,
+            deferred_doras: Vec::new(),
             last_revealed_tile_actor: None,
             pending_reach_accepted: None,
             num_players: 4,
+            time_budget: None,
+            replaying: false,
+            restore_budget: None,
+            input_watch: None,
         }
+    }
+
+    /// Install the shared time-budget slot (builder-style; used by
+    /// `bridge::for_platform`).
+    pub fn with_time_budget(mut self, slot: Option<SharedTimeBudget>) -> Self {
+        self.time_budget = slot;
+        self
+    }
+
+    /// Install the shared input-command counter (builder-style; used by
+    /// `bridge::for_platform`).
+    pub fn with_input_watch(
+        mut self,
+        watch: Option<crate::autoplay::verify::SharedInputWatch>,
+    ) -> Self {
+        self.input_watch = watch;
+        self
     }
 
     /// Open a fresh `majsoul_<ts>.mjai.jsonl` in the platform subdir and
@@ -189,6 +260,12 @@ impl MajsoulBridge {
         match (&msg.msg_type, msg.method_name.as_ref()) {
             (MessageType::Request, METHOD_AUTH_GAME) => {
                 self.account_id = msg.payload.get("account_id").and_then(JsonValue::as_u64);
+                self.game_uuid = msg
+                    .payload
+                    .get("game_uuid")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string);
+                self.game_id = self.game_uuid.as_deref().map(stable_game_id);
                 if self.account_id.is_none() {
                     warn!(
                         target: "akagi::bridge::majsoul",
@@ -199,21 +276,45 @@ impl MajsoulBridge {
                 Vec::new()
             }
             (MessageType::Response, METHOD_AUTH_GAME) => {
+                // New game: whatever window the previous game left in the
+                // budget slot is stale.
+                self.store_budget(None);
                 self.handle_auth_game_response(&msg.payload)
+            }
+            // The client only sends these once it has accepted an input,
+            // so they are the proof an autoplay click landed. No mjai event
+            // comes of them — the server's echo carries the game state.
+            (MessageType::Request, METHOD_INPUT_OPERATION)
+            | (MessageType::Request, METHOD_INPUT_CHI_PENG_GANG) => {
+                if let Some(watch) = &self.input_watch {
+                    if is_client_initiated(&msg.payload) {
+                        watch.note_sent(input_kind(msg.method_name.as_ref(), &msg.payload));
+                    }
+                }
+                Vec::new()
             }
             (MessageType::Notify, METHOD_ACTION_PROTOTYPE) => self.handle_action_prototype(msg),
             (MessageType::Response, METHOD_SYNC_GAME)
             | (MessageType::Response, METHOD_ENTER_GAME) => self.handle_game_restore(&msg.payload),
             (MessageType::Notify, METHOD_NOTIFY_GAME_END_RESULT) => {
-                // `result.players[]` carries final standings. Mjai
-                // `end_game` has no payload — the standings live in the
-                // flow log if anyone needs them. Emitting an empty event
-                // is sufficient to terminate the mjai stream.
                 info!(
                     target: "akagi::bridge::majsoul",
                     "game ended: {}", msg.payload
                 );
-                vec![MjaiEvent::EndGame]
+                self.store_budget(None);
+                let (final_scores, final_ranks) =
+                    parse_game_end_standings(&msg.payload, self.num_players)
+                        .map(|(scores, ranks)| (Some(scores), Some(ranks)))
+                        .unwrap_or((None, None));
+                vec![MjaiEvent::confirmed_game(final_scores, final_ranks)]
+            }
+            (MessageType::Notify, METHOD_NOTIFY_GAME_TERMINATE) => {
+                info!(
+                    target: "akagi::bridge::majsoul",
+                    "game terminated: {}", msg.payload
+                );
+                self.store_budget(None);
+                vec![MjaiEvent::terminated_game()]
             }
             _ => Vec::new(),
         }
@@ -265,6 +366,11 @@ impl MajsoulBridge {
             actions.len()
         );
 
+        // Replayed operations must not clobber the live budget slot with
+        // historical windows; only the final state of the replay matters.
+        self.replaying = true;
+        self.restore_budget = None;
+
         let mut events = Vec::new();
         for action in actions {
             let Some(name) = action.get("name").and_then(JsonValue::as_str) else {
@@ -301,7 +407,96 @@ impl MajsoulBridge {
             };
             events.extend(self.handle_action_prototype(&synthetic));
         }
+        self.replaying = false;
+
+        // Commit the decision window left open at the end of the replay
+        // (if any), backdating `opened_at` by the server-reported time
+        // already consumed in that window. The unit of
+        // `passed_waiting_time` is not confirmed (observed values 13–60);
+        // seconds is assumed. Over-estimating elapsed time only makes the
+        // delay model act sooner — it can never cause an overtime.
+        let passed = payload
+            .pointer("/game_restore/passed_waiting_time")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        let committed = self.restore_budget.take().map(|mut b| {
+            b.opened_at = Instant::now()
+                .checked_sub(Duration::from_secs(passed))
+                .unwrap_or_else(Instant::now);
+            b
+        });
+        self.store_budget(committed);
         events
+    }
+
+    /// Refresh the shared time-budget slot from a live (non-replay) action:
+    /// an operation list addressed to our seat opens a decision window; its
+    /// absence means no window is open (`None` clears the slot). During a
+    /// replay the value is parked in `restore_budget` instead — see
+    /// `handle_game_restore`.
+    fn update_time_budget(&mut self, action_name: &str, data: &JsonValue) {
+        if self.time_budget.is_none() {
+            return;
+        }
+        // The slot is shared by every flow bridge (spectate tabs, the
+        // dying socket during a reconnect). A bridge that never resolved
+        // a seat cannot own a decision window — it must not write, or
+        // its unconditional `None`s would clear the playing flow's
+        // freshly committed budget.
+        if self.seat.is_none() {
+            return;
+        }
+        let budget = self.extract_budget(action_name, data);
+        if self.replaying {
+            self.restore_budget = budget;
+        } else {
+            self.store_budget(budget);
+        }
+    }
+
+    fn store_budget(&self, budget: Option<TimeBudget>) {
+        if let Some(slot) = &self.time_budget {
+            if let Ok(mut guard) = slot.write() {
+                *guard = budget;
+            }
+        }
+    }
+
+    /// Pull a `TimeBudget` out of `data.operation` if the operation list is
+    /// addressed to our seat. `operation` is emitted as `null` for actions
+    /// without one (`skip_default_fields(false)` serialization), hence the
+    /// `as_object` guard. Wire unit is milliseconds.
+    fn extract_budget(&self, action_name: &str, data: &JsonValue) -> Option<TimeBudget> {
+        let op = data.get("operation")?.as_object()?;
+        let seat = op.get("seat").and_then(JsonValue::as_u64)?;
+        if Some(seat) != self.seat.map(u64::from) {
+            return None;
+        }
+        let source = match action_name {
+            ACTION_NEW_ROUND => BudgetSource::NewRound,
+            ACTION_DEAL_TILE => BudgetSource::DealTile,
+            ACTION_DISCARD_TILE => BudgetSource::DiscardTile,
+            ACTION_CHI_PENG_GANG => BudgetSource::ChiPengGang,
+            // Chankan (ron on kakan / kokushi on ankan) and 3p 胡拔北
+            // windows also carry an operation for our seat.
+            ACTION_AN_GANG_ADD_GANG => BudgetSource::AnGangAddGang,
+            ACTION_BA_BEI => BudgetSource::BaBei,
+            _ => return None,
+        };
+        let fixed_ms = op.get("time_fixed").and_then(JsonValue::as_u64)?;
+        // A zero base time means the semantics are unknown (possibly an
+        // unlimited-thinking room). Treat as "no budget" rather than
+        // producing a zero-width window that would floor every delay.
+        if fixed_ms == 0 {
+            return None;
+        }
+        let add_ms = op.get("time_add").and_then(JsonValue::as_u64).unwrap_or(0);
+        Some(TimeBudget {
+            fixed_ms: u32::try_from(fixed_ms).unwrap_or(u32::MAX),
+            add_ms: u32::try_from(add_ms).unwrap_or(u32::MAX),
+            opened_at: Instant::now(),
+            source,
+        })
     }
 
     fn handle_action_prototype(&mut self, msg: &ParsedMessage) -> Vec<MjaiEvent> {
@@ -314,6 +509,8 @@ impl MajsoulBridge {
             );
             return Vec::new();
         };
+
+        self.update_time_budget(action_name, action_data);
 
         // Drain queued reach_accepted before the next non-Hule action. A
         // Hule on the riichi declaration tile voids the riichi, so we
@@ -370,9 +567,12 @@ impl MajsoulBridge {
     /// other players' draws (we don't see what they got), so an empty /
     /// missing tile becomes `"?"`. Our own draws carry the real tile.
     ///
-    /// When this deal is the rinshan after a kan, the new dora marker
-    /// arrives in `data.doras`. Timing depends on the kan type set by the
-    /// preceding meld action (see `DoraTiming`).
+    /// When this deal is the rinshan after an ankan, the new dora marker
+    /// arrives in `data.doras` and flips before the tsumo (即乗り). For
+    /// kakan/daiminkan the live server withholds the marker until the kan
+    /// declarer's next discard (`build_dahai` picks it up there); if it
+    /// nevertheless shows up on the rinshan deal, it is deferred to the
+    /// commit event per 後乗り (see `DoraTiming`).
     fn build_tsumo(&mut self, data: &JsonValue) -> Result<Vec<MjaiEvent>> {
         let self_seat = self.seat.context("seat unresolved at ActionDealTile")?;
         let actor = data.get("seat").and_then(JsonValue::as_u64).unwrap_or(0) as Actor;
@@ -383,49 +583,42 @@ impl MajsoulBridge {
             UNKNOWN_TILE.into()
         };
 
-        let new_marker = self.consume_new_dora(data)?;
+        let mut new_markers = self.consume_new_doras(data)?;
         let timing = self.dora_timing.take();
-        let mut events = Vec::with_capacity(2);
+        let mut events = Vec::with_capacity(new_markers.len() + 1);
 
-        match (new_marker, timing) {
-            (Some(marker), Some(DoraTiming::PendingBeforeRinshan)) => {
+        match timing {
+            Some(DoraTiming::PendingAfterRinshan) => {
+                // Kakan/daiminkan: 後乗り — rinshan tsumo first. Markers
+                // usually arrive with the upcoming discard instead, but if
+                // this deal already carries them, hold them for the commit.
+                self.deferred_doras.append(&mut new_markers);
+                events.push(MjaiEvent::Tsumo { actor, pai });
+            }
+            Some(DoraTiming::PendingBeforeRinshan) => {
                 // Ankan: 即乗り — flip dora, then rinshan tsumo.
-                events.push(MjaiEvent::Dora {
-                    dora_marker: marker,
-                });
+                if new_markers.is_empty() {
+                    warn!(
+                        target: "akagi::bridge::majsoul",
+                        "rinshan deal after ankan missing new dora marker"
+                    );
+                }
+                for dora_marker in new_markers {
+                    events.push(MjaiEvent::Dora { dora_marker });
+                }
                 events.push(MjaiEvent::Tsumo { actor, pai });
             }
-            (Some(marker), Some(DoraTiming::PendingAfterRinshan)) => {
-                // Kakan/daiminkan: 後乗り — rinshan tsumo first, dora
-                // deferred until the next dahai.
-                events.push(MjaiEvent::Tsumo { actor, pai });
-                self.deferred_dora = Some(marker);
-            }
-            (Some(marker), None) => {
+            None => {
                 // Unexpected dora bump outside a kan flow. Fall back to
                 // emitting it before tsumo (Akagi-style) and warn so the
                 // protocol drift is visible in logs.
-                warn!(
-                    target: "akagi::bridge::majsoul",
-                    "new dora marker {marker} without preceding kan; emitting before tsumo"
-                );
-                events.push(MjaiEvent::Dora {
-                    dora_marker: marker,
-                });
-                events.push(MjaiEvent::Tsumo { actor, pai });
-            }
-            (None, Some(DoraTiming::PendingBeforeRinshan))
-            | (None, Some(DoraTiming::PendingAfterRinshan)) => {
-                // Kan declared but rinshan deal carried no new dora — the
-                // wire format always includes it for kans, so this is
-                // unusual. Emit tsumo and move on.
-                warn!(
-                    target: "akagi::bridge::majsoul",
-                    "rinshan deal after kan missing new dora marker"
-                );
-                events.push(MjaiEvent::Tsumo { actor, pai });
-            }
-            (None, None) => {
+                for dora_marker in new_markers {
+                    warn!(
+                        target: "akagi::bridge::majsoul",
+                        "new dora marker {dora_marker} without preceding kan; emitting before tsumo"
+                    );
+                    events.push(MjaiEvent::Dora { dora_marker });
+                }
                 events.push(MjaiEvent::Tsumo { actor, pai });
             }
         }
@@ -436,8 +629,11 @@ impl MajsoulBridge {
     /// directly to `tsumogiri`. `seat` defaults to 0 — Majsoul omits it
     /// for the dealer's first discard.
     ///
-    /// If a dora marker is queued for 後乗り (open-kan flow), it is
-    /// flushed *before* the dahai event.
+    /// Kan dora (後乗り): after a kakan/daiminkan the live server reveals
+    /// the new marker by growing this message's `doras` array — the
+    /// rinshan deal does *not* carry it. Any markers found here (plus any
+    /// deferred from the rinshan deal) are emitted *before* the dahai
+    /// event, matching the mjai state machine (tsumo → dora → dahai).
     ///
     /// Riichi: when `is_liqi` (or `is_wliqi`, double riichi) is set, a
     /// `reach` event precedes the `dahai` and `pending_reach_accepted` is
@@ -468,11 +664,12 @@ impl MajsoulBridge {
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(false);
 
-        let mut events = Vec::with_capacity(3);
-        if let Some(marker) = self.deferred_dora.take() {
-            events.push(MjaiEvent::Dora {
-                dora_marker: marker,
-            });
+        let mut dora_markers = std::mem::take(&mut self.deferred_doras);
+        dora_markers.extend(self.consume_new_doras(data)?);
+
+        let mut events = Vec::with_capacity(dora_markers.len() + 2);
+        for dora_marker in dora_markers {
+            events.push(MjaiEvent::Dora { dora_marker });
         }
         if is_riichi {
             events.push(MjaiEvent::Reach { actor, pai: None });
@@ -489,24 +686,54 @@ impl MajsoulBridge {
         Ok(events)
     }
 
-    /// Compare `data.doras` against `self.doras`. If a new marker has
-    /// appeared (length grew), map the last entry to mjai, push it onto
-    /// `self.doras`, and return it. Returns `None` when nothing is new.
-    fn consume_new_dora(&mut self, data: &JsonValue) -> Result<Option<String>> {
+    /// Compare `data.doras` against `self.doras`. If the server array has
+    /// grown, return every newly appended entry (mjai-mapped, in reveal
+    /// order) and sync `self.doras` to the full server array. Returns an
+    /// empty vec when nothing is new.
+    ///
+    /// Syncing the full tail (not just the last entry) matters: the local
+    /// list must never fall behind the server's, otherwise a later payload
+    /// whose array hasn't grown would still compare longer and re-emit a
+    /// stale marker (the double-`9m` in issue #244).
+    ///
+    /// The already-seen prefix is also validated. Indicators flip in dead
+    /// wall slot order, so the server array should only ever *extend*
+    /// what we've reported; a rewritten prefix means that assumption
+    /// broke, and since mjai cannot retract an emitted marker the best we
+    /// can do is warn and adopt the server's tail going forward.
+    fn consume_new_doras(&mut self, data: &JsonValue) -> Result<Vec<String>> {
         let arr = match data.get("doras").and_then(JsonValue::as_array) {
             Some(a) => a,
-            None => return Ok(None),
+            None => return Ok(Vec::new()),
         };
-        if arr.len() <= self.doras.len() {
-            return Ok(None);
+        if arr.is_empty() {
+            return Ok(Vec::new());
         }
-        let last = arr
-            .last()
-            .and_then(JsonValue::as_str)
-            .context("doras[last] not a string")?;
-        let mjai = ms_to_mjai(last)?.to_string();
-        self.doras.push(mjai.clone());
-        Ok(Some(mjai))
+        let mapped = arr
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .context("doras entry not a string")
+                    .and_then(|raw| ms_to_mjai(raw).map(|t| t.to_string()))
+            })
+            .collect::<Result<Vec<String>>>()?;
+
+        let prefix_len = self.doras.len().min(mapped.len());
+        if self.doras[..prefix_len] != mapped[..prefix_len] {
+            warn!(
+                target: "akagi::bridge::majsoul",
+                "server dora array {mapped:?} does not extend the markers reported so far {local:?}; \
+                 adopting the server tail (already-emitted markers cannot be retracted)",
+                local = self.doras
+            );
+        }
+        if mapped.len() <= self.doras.len() {
+            return Ok(Vec::new());
+        }
+        let new_markers = mapped[self.doras.len()..].to_vec();
+        self.doras = mapped;
+        Ok(new_markers)
     }
 
     /// `ActionChiPengGang` → `chi` / `pon` / `daiminkan`. `froms[i]`
@@ -628,6 +855,12 @@ impl MajsoulBridge {
     /// `tiles` field is a single tile string (not a list) — for ankan it
     /// names the four-of-a-kind, for kakan it names the new tile being
     /// added on top of an existing pon.
+    ///
+    /// The payload has a `doras` field; live servers deliver kan reveals
+    /// on later messages instead, but it is consumed here defensively so
+    /// a marker arriving this early is neither lost nor double-emitted:
+    /// for ankan it flips right after the `ankan` event (即乗り), for
+    /// kakan it is deferred to the commit event (後乗り).
     fn build_an_gang_add_gang(&mut self, data: &JsonValue) -> Result<Vec<MjaiEvent>> {
         let actor = data
             .get("seat")
@@ -643,25 +876,35 @@ impl MajsoulBridge {
             .context("ActionAnGangAddGang.tiles not a string")?;
         let pai = ms_to_mjai(tile_raw)?.to_string();
 
-        let event = match kind {
+        let mut new_markers = self.consume_new_doras(data)?;
+        let mut events = Vec::with_capacity(new_markers.len() + 1);
+        match kind {
             AN_GANG_ADD_GANG_AN => {
                 let consumed = ankan_consumed(&pai);
-                // 即乗り: dora flips before the rinshan tsumo.
-                self.dora_timing = Some(DoraTiming::PendingBeforeRinshan);
-                MjaiEvent::Ankan { actor, consumed }
+                events.push(MjaiEvent::Ankan { actor, consumed });
+                if new_markers.is_empty() {
+                    // 即乗り: the reveal rides the upcoming rinshan deal.
+                    self.dora_timing = Some(DoraTiming::PendingBeforeRinshan);
+                } else {
+                    // Reveal already delivered with the kan itself.
+                    for dora_marker in new_markers {
+                        events.push(MjaiEvent::Dora { dora_marker });
+                    }
+                }
             }
             AN_GANG_ADD_GANG_ADD => {
                 let consumed = kakan_consumed(&pai);
                 // 後乗り: dora flips after rinshan tsumo, before dahai.
+                self.deferred_doras.append(&mut new_markers);
                 self.dora_timing = Some(DoraTiming::PendingAfterRinshan);
-                MjaiEvent::Kakan {
+                events.push(MjaiEvent::Kakan {
                     actor,
                     pai,
                     consumed,
-                }
+                });
             }
             other => bail!("unknown ActionAnGangAddGang.type: {other}"),
-        };
+        }
         // Both kan types reveal a tile that another seat may rob:
         //   - kakan → 搶槓 (chankan).
         //   - ankan → 国士無双搶暗槓 (only kokushi can rob; the server
@@ -669,7 +912,7 @@ impl MajsoulBridge {
         //     unconditional tracking is safe).
         // If a ron follows, `build_hule` uses this seat as the `target`.
         self.last_revealed_tile_actor = Some(actor);
-        Ok(vec![event])
+        Ok(events)
     }
 
     /// `ActionNoTile` (荒牌流局, exhaustive draw) → `[ryukyoku{deltas},
@@ -793,7 +1036,7 @@ impl MajsoulBridge {
     /// The seat must already be resolved via the prior `authGame` exchange;
     /// otherwise we have no way to know which tehai slot to fill in.
     ///
-    /// Resets per-kyoku dora-tracking state so a stale `deferred_dora` from
+    /// Resets per-kyoku dora-tracking state so stale `deferred_doras` from
     /// a previous kyoku can't bleed into this one.
     fn build_start_kyoku(&mut self, data: &JsonValue) -> Result<Vec<MjaiEvent>> {
         let seat = self.seat.context("seat unresolved at ActionNewRound")?;
@@ -887,7 +1130,7 @@ impl MajsoulBridge {
         // Fresh kyoku — reset dora + riichi + discard bookkeeping.
         self.doras = vec![dora_marker.clone()];
         self.dora_timing = None;
-        self.deferred_dora = None;
+        self.deferred_doras.clear();
         self.last_revealed_tile_actor = None;
         self.pending_reach_accepted = None;
 
@@ -902,6 +1145,7 @@ impl MajsoulBridge {
                 scores,
                 tehais,
                 num_players: self.num_players,
+                catch_up: 0,
             },
             tsumo_event,
         ])
@@ -920,8 +1164,12 @@ impl MajsoulBridge {
     /// Notes:
     /// - No `tile` field — kita is always the North tile, so we hardcode
     ///   `pai = "N"` per the mjai 3p extension.
-    /// - `doras: []` — kita does NOT flip a new dora indicator (Tenhou
-    ///   rule, confirmed live). Skip dora bookkeeping entirely.
+    /// - `doras: []` — kita itself does NOT flip a new dora indicator
+    ///   (Tenhou rule, confirmed live). The array is still checked: after
+    ///   a kakan/daiminkan the declarer may pull North instead of
+    ///   discarding, and that babei is then the commit event carrying the
+    ///   kan's 後乗り reveal — emitted before the `kita` event, together
+    ///   with any marker deferred from the rinshan deal.
     /// - `last_revealed_tile_actor` is updated so a follow-up ron-on-kita
     ///   (chankan-style) gets the correct `target` in `build_hule`.
     ///
@@ -939,11 +1187,19 @@ impl MajsoulBridge {
                 self.num_players
             );
         }
+        let mut dora_markers = std::mem::take(&mut self.deferred_doras);
+        dora_markers.extend(self.consume_new_doras(data)?);
+
+        let mut events = Vec::with_capacity(dora_markers.len() + 1);
+        for dora_marker in dora_markers {
+            events.push(MjaiEvent::Dora { dora_marker });
+        }
         self.last_revealed_tile_actor = Some(actor);
-        Ok(vec![MjaiEvent::Kita {
+        events.push(MjaiEvent::Kita {
             actor,
             pai: Some("N".to_string()),
-        }])
+        });
+        Ok(events)
     }
 
     fn handle_auth_game_response(&mut self, payload: &JsonValue) -> Vec<MjaiEvent> {
@@ -985,13 +1241,24 @@ impl MajsoulBridge {
         } else {
             self.num_players = detected;
         }
-        let mode_id = payload
-            .pointer("/game_config/meta/mode_id")
-            .and_then(JsonValue::as_u64);
+        let meta_u32 = |key: &str| {
+            payload
+                .pointer(&format!("/game_config/meta/{key}"))
+                .and_then(JsonValue::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|&value| value != 0)
+        };
+        let mode_id = meta_u32("mode_id");
+        let room_id = meta_u32("room_id");
+        let contest_uid = meta_u32("contest_uid");
+        let match_mode = payload
+            .pointer("/game_config/mode/mode")
+            .and_then(JsonValue::as_u64)
+            .and_then(|value| u8::try_from(value).ok());
         let names = names_from_payload(payload, seat_list);
         info!(
             target: "akagi::bridge::majsoul",
-            "seat resolved: account_id={account_id} seat={seat} num_players={np} mode_id={mode_id:?} names={names:?}",
+            "seat resolved: account_id={account_id} seat={seat} num_players={np} mode_id={mode_id:?} match_mode={match_mode:?} names={names:?}",
             np = self.num_players,
         );
         vec![MjaiEvent::StartGame {
@@ -1000,8 +1267,59 @@ impl MajsoulBridge {
             aka_flag: None,
             id: Some(seat),
             num_players: self.num_players,
+            game_meta: Some(GameMeta {
+                game_id: self.game_id,
+                match_mode,
+                match_info: Some(MatchInfo::Majsoul {
+                    game_uuid: self.game_uuid.clone(),
+                    mode_id,
+                    room_id,
+                    contest_uid,
+                }),
+            }),
         }]
     }
+}
+
+fn stable_game_id(game_uuid: &str) -> u64 {
+    // FNV-1a gives a compact, stable reconnect key for the recorder's dedup.
+    // The raw UUID is kept separately on the bridge and persisted via
+    // `MatchInfo` into the local history index (never uploaded).
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in game_uuid.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// `result.players` is ordered by placement and each row carries its absolute
+/// seat plus the raw final score (`part_point_1`). Convert both to seat order.
+fn parse_game_end_standings(payload: &JsonValue, num_players: u8) -> Option<(Vec<i32>, Vec<u8>)> {
+    let n = usize::from(num_players);
+    if !(3..=4).contains(&n) {
+        return None;
+    }
+    let players = payload.pointer("/result/players")?.as_array()?;
+    if players.len() != n {
+        return None;
+    }
+
+    let mut scores = vec![None; n];
+    let mut ranks = vec![None; n];
+    for (rank0, player) in players.iter().enumerate() {
+        let seat = usize::try_from(player.get("seat")?.as_u64()?).ok()?;
+        let score = i32::try_from(player.get("part_point_1")?.as_i64()?).ok()?;
+        if seat >= n || scores[seat].is_some() {
+            return None;
+        }
+        scores[seat] = Some(score);
+        ranks[seat] = Some((rank0 + 1) as u8);
+    }
+    Some((
+        scores.into_iter().collect::<Option<Vec<_>>>()?,
+        ranks.into_iter().collect::<Option<Vec<_>>>()?,
+    ))
 }
 
 /// Parse `data.scores` into a `Vec<i32>` of native length (3 for sanma, 4 for
@@ -1135,6 +1453,50 @@ fn names_from_payload(payload: &JsonValue, seat_list: &[JsonValue]) -> Vec<Strin
         .collect()
 }
 
+/// `inputOperation` op types autoplay needs to tell apart. Anything else
+/// (and every `inputChiPengGang`) counts as `Other` — presence is what
+/// matters there, not identity. See `autoplay::verify::InputKind` for why
+/// these two are singled out:
+/// Riichi goes out as `inputOperation` with the reach op type; a plain
+/// discard of the same tile is `type: 1`. Telling them apart is what lets
+/// autoplay notice that a riichi declaration was lost while its discard
+/// went through anyway.
+const OP_TYPE_REACH: u64 = 7;
+/// A plain discard. Distinguished because an own-turn window that expires
+/// is answered by the client with a tsumogiri carrying a small, plausible
+/// `timeuse` and no `auto_operation` flag — `is_client_initiated` cannot
+/// filter it, so the discard kind lets the verifier refuse it as proof
+/// that an action-button press landed.
+const OP_TYPE_DISCARD: u64 = 1;
+
+fn input_kind(method: &str, payload: &JsonValue) -> crate::autoplay::InputKind {
+    if method != METHOD_INPUT_OPERATION {
+        return crate::autoplay::InputKind::Other;
+    }
+    match payload.get("type").and_then(JsonValue::as_u64) {
+        Some(OP_TYPE_REACH) => crate::autoplay::InputKind::Reach,
+        Some(OP_TYPE_DISCARD) => crate::autoplay::InputKind::Discard,
+        _ => crate::autoplay::InputKind::Other,
+    }
+}
+
+/// Whether an input command was the player's own press rather than the
+/// client acting for them (auto-discard setting, or a decision window
+/// that ran out). The latter must not count as proof a click landed.
+fn is_client_initiated(payload: &JsonValue) -> bool {
+    if payload
+        .get("auto_operation")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    payload
+        .get("timeuse")
+        .and_then(JsonValue::as_u64)
+        .is_none_or(|t| t < TIMEUSE_CLIENT_AUTO)
+}
+
 impl Default for MajsoulBridge {
     fn default() -> Self {
         Self::new(None, None)
@@ -1247,6 +1609,146 @@ mod tests {
             method_name: Arc::from(method),
             payload,
         }
+    }
+
+    /// Autoplay tells a click that registered from one the UI swallowed by
+    /// watching for the client's own uplink command. Both input methods
+    /// must count, and only the uplink: a response coming back is not the
+    /// client accepting anything.
+    #[test]
+    fn input_commands_are_counted_for_click_verification() {
+        let watch: crate::autoplay::verify::SharedInputWatch = Default::default();
+        let mut bridge = MajsoulBridge::new(None, None).with_input_watch(Some(watch.clone()));
+        let ticket = watch.ticket();
+
+        let events = bridge.dispatch(&req(
+            METHOD_INPUT_OPERATION,
+            json!({ "type": 1, "tile": "1m" }),
+        ));
+        assert!(events.is_empty(), "an input command is not an mjai event");
+        assert!(watch.sent_since(ticket), "a discard must count");
+
+        let ticket = watch.ticket();
+        bridge.dispatch(&req(METHOD_INPUT_CHI_PENG_GANG, json!({ "type": 1 })));
+        assert!(watch.sent_since(ticket), "a call must count");
+
+        // The server's acknowledgement is not the client sending an input.
+        let ticket = watch.ticket();
+        bridge.dispatch(&resp(METHOD_INPUT_OPERATION, json!({})));
+        assert!(!watch.sent_since(ticket));
+    }
+
+    /// The client acts on its own when a decision window runs out, and
+    /// stamps that with `timeuse: 1000000`. Counting it would report a
+    /// retry as having registered at the exact moment the press
+    /// demonstrably failed — the one case the check exists to catch.
+    #[test]
+    fn the_clients_own_timeout_action_is_not_a_click() {
+        let watch: crate::autoplay::verify::SharedInputWatch = Default::default();
+        let mut bridge = MajsoulBridge::new(None, None).with_input_watch(Some(watch.clone()));
+
+        let ticket = watch.ticket();
+        bridge.dispatch(&req(
+            METHOD_INPUT_CHI_PENG_GANG,
+            json!({ "cancel_operation": true, "index": 0, "timeuse": 1_000_000, "type": 0 }),
+        ));
+        assert!(
+            !watch.sent_since(ticket),
+            "a timed-out window is not a press"
+        );
+
+        // The explicit auto flag, where the message carries one.
+        bridge.dispatch(&req(
+            METHOD_INPUT_OPERATION,
+            json!({ "auto_operation": true, "timeuse": 3, "type": 1, "tile": "1m" }),
+        ));
+        assert!(!watch.sent_since(ticket), "an auto action is not a press");
+
+        // A human-scale think time still counts.
+        bridge.dispatch(&req(
+            METHOD_INPUT_CHI_PENG_GANG,
+            json!({ "cancel_operation": true, "index": 0, "timeuse": 2, "type": 0 }),
+        ));
+        assert!(watch.sent_since(ticket));
+    }
+
+    /// A riichi and a plain discard of the same tile are both
+    /// `inputOperation`; only the op type separates them. Autoplay needs
+    /// that separation because a riichi plan whose declaration press was
+    /// lost still sends the discard, and presence alone would read as
+    /// success.
+    #[test]
+    fn a_riichi_is_distinguished_from_a_plain_discard() {
+        let watch: crate::autoplay::verify::SharedInputWatch = Default::default();
+        let mut bridge = MajsoulBridge::new(None, None).with_input_watch(Some(watch.clone()));
+
+        let ticket = watch.ticket();
+        bridge.dispatch(&req(
+            METHOD_INPUT_OPERATION,
+            json!({ "type": 1, "tile": "4z", "moqie": false, "timeuse": 7 }),
+        ));
+        assert!(watch.sent_since(ticket), "the discard was sent");
+        assert!(!watch.reach_since(ticket), "but it declared nothing");
+
+        let ticket = watch.ticket();
+        bridge.dispatch(&req(
+            METHOD_INPUT_OPERATION,
+            json!({ "type": 7, "tile": "4z", "moqie": false, "timeuse": 5 }),
+        ));
+        assert!(watch.reach_since(ticket), "type 7 is the declaration");
+
+        // A call is not a riichi either, whatever its own type number.
+        let ticket = watch.ticket();
+        bridge.dispatch(&req(
+            METHOD_INPUT_CHI_PENG_GANG,
+            json!({ "type": 7, "index": 0, "timeuse": 2 }),
+        ));
+        assert!(watch.sent_since(ticket) && !watch.reach_since(ticket));
+    }
+
+    /// An own-turn window that runs out is answered by the client with a
+    /// tsumogiri stamped with a plausible `timeuse` and *no*
+    /// `auto_operation` flag — on the wire it is indistinguishable from a
+    /// pressed tile, so `is_client_initiated` rightly lets it through. It
+    /// must still not satisfy the button-press proof standard: a plan that
+    /// clicked only action buttons (e.g. an ankan) never presses a tile,
+    /// so a plain discard cannot mean its press landed.
+    #[test]
+    fn a_turn_timeout_tsumogiri_is_a_discard_not_a_button_press() {
+        let watch: crate::autoplay::verify::SharedInputWatch = Default::default();
+        let mut bridge = MajsoulBridge::new(None, None).with_input_watch(Some(watch.clone()));
+
+        let ticket = watch.ticket();
+        // The exact shape of the offending frame.
+        bridge.dispatch(&req(
+            METHOD_INPUT_OPERATION,
+            json!({
+                "auto_operation": false, "cancel_operation": false,
+                "moqie": true, "tile": "4m", "timeuse": 5, "type": 1
+            }),
+        ));
+        assert!(watch.sent_since(ticket), "it is a real input command");
+        assert!(
+            !watch.non_discard_since(ticket),
+            "but a plain discard cannot prove an action-button press"
+        );
+
+        // A call — what a landed claim press actually produces — does.
+        let ticket = watch.ticket();
+        bridge.dispatch(&req(
+            METHOD_INPUT_CHI_PENG_GANG,
+            json!({ "type": 2, "index": 0, "timeuse": 3 }),
+        ));
+        assert!(watch.non_discard_since(ticket));
+    }
+
+    /// Without a watch attached (the state the bridge is in on the MITM
+    /// path) the same frames must still parse harmlessly.
+    #[test]
+    fn input_commands_are_harmless_without_a_watch() {
+        let mut bridge = MajsoulBridge::new(None, None);
+        let events = bridge.dispatch(&req(METHOD_INPUT_OPERATION, json!({ "type": 1 })));
+        assert!(events.is_empty());
     }
 
     /// Full `.lq.FastTest.syncGame` response captured from a real mid-game
@@ -1460,6 +1962,56 @@ mod tests {
     }
 
     #[test]
+    fn auth_game_carries_private_length_and_reconnect_metadata() {
+        let mut bridge = MajsoulBridge::new(None, None);
+        let game_uuid = "230723-test-game-uuid";
+        bridge.dispatch(&req(
+            METHOD_AUTH_GAME,
+            json!({ "account_id": 100, "game_uuid": game_uuid }),
+        ));
+        let events = bridge.dispatch(&resp(
+            METHOD_AUTH_GAME,
+            json!({
+                "game_config": {
+                    "category": 2,
+                    "meta": { "mode_id": 12 },
+                    "mode": { "mode": 2 }
+                },
+                "players": [
+                    { "account_id": 100, "nickname": "me" }
+                ],
+                "seat_list": [100u64, 1u64, 2u64, 3u64]
+            }),
+        ));
+        match &events[0] {
+            MjaiEvent::StartGame { game_meta, .. } => {
+                let meta = game_meta.as_ref().expect("Mahjong Soul metadata");
+                assert_eq!(meta.game_id, Some(stable_game_id(game_uuid)));
+                assert_eq!(meta.match_mode, Some(2));
+                match &meta.match_info {
+                    Some(MatchInfo::Majsoul {
+                        game_uuid: uuid,
+                        mode_id,
+                        room_id,
+                        contest_uid,
+                    }) => {
+                        assert_eq!(uuid.as_deref(), Some(game_uuid));
+                        assert_eq!(*mode_id, Some(12));
+                        assert_eq!(*room_id, None);
+                        assert_eq!(*contest_uid, None);
+                    }
+                    other => panic!("expected Majsoul match_info, got {other:?}"),
+                }
+            }
+            other => panic!("expected StartGame, got {other:?}"),
+        }
+        assert!(serde_json::to_value(&events[0])
+            .unwrap()
+            .get("game_meta")
+            .is_none());
+    }
+
+    #[test]
     fn names_filled_for_four_human_players() {
         let mut bridge = MajsoulBridge::new(None, None);
         bridge.dispatch(&req(METHOD_AUTH_GAME, json!({ "account_id": 100 })));
@@ -1525,6 +2077,7 @@ mod tests {
                 id,
                 names,
                 num_players,
+                game_meta,
                 ..
             } => {
                 assert_eq!(*id, Some(1));
@@ -1533,6 +2086,21 @@ mod tests {
                     names,
                     &vec!["".to_string(), "player_a".to_string(), "".to_string()]
                 );
+                // Zero-valued meta ids mean "not applicable" and are dropped;
+                // the friendly/AI room number is kept as-is.
+                match &game_meta.as_ref().expect("game meta").match_info {
+                    Some(MatchInfo::Majsoul {
+                        mode_id,
+                        room_id,
+                        contest_uid,
+                        ..
+                    }) => {
+                        assert_eq!(*mode_id, None);
+                        assert_eq!(*room_id, Some(33123));
+                        assert_eq!(*contest_uid, None);
+                    }
+                    other => panic!("expected Majsoul match_info, got {other:?}"),
+                }
             }
             other => panic!("expected StartGame, got {other:?}"),
         }
@@ -1724,6 +2292,7 @@ mod tests {
                 scores,
                 tehais,
                 num_players,
+                ..
             } => {
                 assert_eq!(bakaze, "E");
                 assert_eq!(dora_marker, "4s");
@@ -1883,6 +2452,7 @@ mod tests {
                 scores,
                 tehais,
                 num_players,
+                ..
             } => {
                 assert_eq!(bakaze, "E");
                 assert_eq!(dora_marker, "N");
@@ -2325,7 +2895,7 @@ mod tests {
         ));
         assert_eq!(bridge.doras, vec!["E".to_string()]);
         assert!(bridge.dora_timing.is_none());
-        assert!(bridge.deferred_dora.is_none());
+        assert!(bridge.deferred_doras.is_empty());
     }
 
     /// Riichi declaration tile passes through normally, then a kita
@@ -2466,12 +3036,13 @@ mod tests {
             other => panic!("expected Tsumo second, got {other:?}"),
         }
         assert!(bridge.dora_timing.is_none());
-        assert!(bridge.deferred_dora.is_none());
+        assert!(bridge.deferred_doras.is_empty());
     }
 
-    /// Daiminkan flow: daiminkan → ActionDealTile must emit only Tsumo
-    /// (dora deferred). Then ActionDiscardTile must prepend the dora
-    /// before dahai (後乗り).
+    /// Daiminkan flow as the live server sends it: the rinshan
+    /// ActionDealTile does NOT carry the new marker; the grown `doras`
+    /// array rides the declarer's next ActionDiscardTile. The dora must
+    /// still flip before the dahai event (後乗り).
     #[test]
     fn daiminkan_then_rinshan_then_discard_emits_dora_before_dahai() {
         let mut bridge = MajsoulBridge::new(None, None);
@@ -2488,10 +3059,10 @@ mod tests {
             }),
         ));
 
-        // Rinshan: tsumo only, dora deferred.
+        // Rinshan: tsumo only — the server hasn't revealed the marker yet.
         let events = bridge.dispatch(&action_msg(
             ACTION_DEAL_TILE,
-            json!({ "seat": 2, "tile": "9p", "doras": ["1z", "3z"] }),
+            json!({ "seat": 2, "tile": "9p", "doras": ["1z"] }),
         ));
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -2501,13 +3072,13 @@ mod tests {
             }
             other => panic!("expected single Tsumo, got {other:?}"),
         }
-        assert_eq!(bridge.deferred_dora, Some("W".to_string()));
+        assert!(bridge.deferred_doras.is_empty());
         assert!(bridge.dora_timing.is_none());
 
-        // Next discard: dora flushed first, then dahai.
+        // The discard carries the reveal: dora first, then dahai.
         let events = bridge.dispatch(&action_msg(
             ACTION_DISCARD_TILE,
-            json!({ "seat": 2, "tile": "9p", "moqie": true }),
+            json!({ "seat": 2, "tile": "9p", "moqie": true, "doras": ["1z", "3z"] }),
         ));
         assert_eq!(events.len(), 2);
         match &events[0] {
@@ -2526,12 +3097,49 @@ mod tests {
             }
             other => panic!("expected Dahai second, got {other:?}"),
         }
-        assert!(bridge.deferred_dora.is_none());
+        assert!(bridge.deferred_doras.is_empty());
+        assert_eq!(bridge.doras, vec!["E".to_string(), "W".to_string()]);
     }
 
-    /// Kakan follows the same 後乗り timing as daiminkan.
+    /// Kakan follows the same 後乗り timing as daiminkan (reveal rides
+    /// the declarer's discard, flips before the dahai event).
     #[test]
     fn kakan_then_rinshan_then_discard_emits_dora_before_dahai() {
+        let mut bridge = MajsoulBridge::new(None, None);
+        bridge.seat = Some(0);
+        bridge.doras = vec!["E".to_string()];
+
+        bridge.dispatch(&action_msg(
+            ACTION_AN_GANG_ADD_GANG,
+            json!({ "seat": 0, "type": 2, "tiles": "5m" }),
+        ));
+
+        let events = bridge.dispatch(&action_msg(
+            ACTION_DEAL_TILE,
+            json!({ "seat": 0, "tile": "1p" }),
+        ));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], MjaiEvent::Tsumo { .. }));
+        assert!(bridge.deferred_doras.is_empty());
+
+        let events = bridge.dispatch(&action_msg(
+            ACTION_DISCARD_TILE,
+            json!({ "seat": 0, "tile": "1p", "moqie": true, "doras": ["1z", "4z"] }),
+        ));
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            MjaiEvent::Dora { dora_marker } => assert_eq!(dora_marker, "N"),
+            other => panic!("expected Dora first, got {other:?}"),
+        }
+        assert!(matches!(events[1], MjaiEvent::Dahai { .. }));
+    }
+
+    /// Defensive: if a kakan's marker nevertheless arrives already on the
+    /// rinshan deal (older captures suggested this shape), it must be
+    /// deferred to the dahai — and the discard's own unchanged `doras`
+    /// array must not double-emit it.
+    #[test]
+    fn kakan_dora_on_rinshan_deal_is_deferred_until_dahai() {
         let mut bridge = MajsoulBridge::new(None, None);
         bridge.seat = Some(0);
         bridge.doras = vec!["E".to_string()];
@@ -2547,11 +3155,11 @@ mod tests {
         ));
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], MjaiEvent::Tsumo { .. }));
-        assert_eq!(bridge.deferred_dora, Some("N".to_string()));
+        assert_eq!(bridge.deferred_doras, vec!["N".to_string()]);
 
         let events = bridge.dispatch(&action_msg(
             ACTION_DISCARD_TILE,
-            json!({ "seat": 0, "tile": "1p", "moqie": true }),
+            json!({ "seat": 0, "tile": "1p", "moqie": true, "doras": ["1z", "4z"] }),
         ));
         assert_eq!(events.len(), 2);
         match &events[0] {
@@ -2559,6 +3167,256 @@ mod tests {
             other => panic!("expected Dora first, got {other:?}"),
         }
         assert!(matches!(events[1], MjaiEvent::Dahai { .. }));
+        assert!(bridge.deferred_doras.is_empty());
+    }
+
+    /// Regression for issue #244 (reported via #243): East 1 with three
+    /// kans — kakan hatsu, ankan 1p, kakan North. Real wire shape: kan
+    /// reveals ride the declarer's ActionDiscardTile, ankan's rides the
+    /// rinshan ActionDealTile. The old code dropped the kakan reveals and
+    /// re-emitted a stale marker (`9m` twice, `5m`/`5p` never). The full
+    /// event-kind sequence is pinned so ordering regressions relative to
+    /// tsumo/dahai are caught here too.
+    #[test]
+    fn issue_244_multiple_kans_emit_correct_dora_sequence() {
+        let mut bridge = MajsoulBridge::new(None, None);
+        bridge.seat = Some(3);
+        bridge.doras = vec!["8p".to_string()];
+        let mut emitted: Vec<String> = Vec::new();
+        let mut collect = |evs: Vec<MjaiEvent>| {
+            for e in evs {
+                emitted.push(match &e {
+                    MjaiEvent::Dora { dora_marker } => format!("dora:{dora_marker}"),
+                    MjaiEvent::Tsumo { .. } => "tsumo".into(),
+                    MjaiEvent::Dahai { .. } => "dahai".into(),
+                    MjaiEvent::Ankan { .. } => "ankan".into(),
+                    MjaiEvent::Kakan { .. } => "kakan".into(),
+                    other => format!("{other:?}"),
+                });
+            }
+        };
+
+        // Kakan hatsu by seat 2; reveal (5m) rides the discard.
+        collect(bridge.dispatch(&action_msg(
+            ACTION_AN_GANG_ADD_GANG,
+            json!({ "seat": 2, "type": 2, "tiles": "6z" }),
+        )));
+        collect(bridge.dispatch(&action_msg(
+            ACTION_DEAL_TILE,
+            json!({ "seat": 2, "tile": "" }),
+        )));
+        collect(bridge.dispatch(&action_msg(
+            ACTION_DISCARD_TILE,
+            json!({ "seat": 2, "tile": "1z", "moqie": true, "doras": ["8p", "5m"] }),
+        )));
+
+        // Ankan 1p by seat 0; reveal (9m) rides the rinshan deal.
+        collect(bridge.dispatch(&action_msg(
+            ACTION_AN_GANG_ADD_GANG,
+            json!({ "seat": 0, "type": 3, "tiles": "1p" }),
+        )));
+        collect(bridge.dispatch(&action_msg(
+            ACTION_DEAL_TILE,
+            json!({ "seat": 0, "tile": "", "doras": ["8p", "5m", "9m"] }),
+        )));
+        collect(bridge.dispatch(&action_msg(
+            ACTION_DISCARD_TILE,
+            json!({ "seat": 0, "tile": "2z", "moqie": true }),
+        )));
+
+        // Kakan North by seat 3; rinshan deal repeats the unchanged
+        // 3-entry array (this used to re-emit a stale 9m), reveal (5p)
+        // rides the discard.
+        collect(bridge.dispatch(&action_msg(
+            ACTION_AN_GANG_ADD_GANG,
+            json!({ "seat": 3, "type": 2, "tiles": "4z" }),
+        )));
+        collect(bridge.dispatch(&action_msg(
+            ACTION_DEAL_TILE,
+            json!({ "seat": 3, "tile": "5p", "doras": ["8p", "5m", "9m"] }),
+        )));
+        collect(bridge.dispatch(&action_msg(
+            ACTION_DISCARD_TILE,
+            json!({ "seat": 3, "tile": "5p", "moqie": true, "doras": ["8p", "5m", "9m", "5p"] }),
+        )));
+
+        assert_eq!(
+            emitted,
+            vec![
+                // kakan hatsu: reveal flips before the declarer's dahai
+                "kakan", "tsumo", "dora:5m", "dahai", //
+                // ankan 1p: reveal flips before the rinshan tsumo
+                "ankan", "dora:9m", "tsumo", "dahai", //
+                // kakan North: unchanged deal array must not re-emit 9m
+                "kakan", "tsumo", "dora:5p", "dahai",
+            ],
+            "mjai event sequence must match the game's reveals and spec ordering"
+        );
+        assert_eq!(
+            bridge.doras,
+            vec![
+                "8p".to_string(),
+                "5m".to_string(),
+                "9m".to_string(),
+                "5p".to_string()
+            ]
+        );
+    }
+
+    /// Consecutive kans by one declarer with no discard in between:
+    /// kakan (reveal still pending) → rinshan → ankan → rinshan. Both
+    /// flips arrive together on the ankan's rinshan deal in slot order —
+    /// the pending kakan marker first, then the ankan's, both before the
+    /// tsumo. The following discard's unchanged array adds nothing.
+    #[test]
+    fn consecutive_kans_flush_both_markers_at_ankan_rinshan() {
+        let mut bridge = MajsoulBridge::new(None, None);
+        bridge.seat = Some(0);
+        bridge.doras = vec!["E".to_string()];
+
+        bridge.dispatch(&action_msg(
+            ACTION_AN_GANG_ADD_GANG,
+            json!({ "seat": 1, "type": 2, "tiles": "5m" }),
+        ));
+        let events = bridge.dispatch(&action_msg(
+            ACTION_DEAL_TILE,
+            json!({ "seat": 1, "tile": "" }),
+        ));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], MjaiEvent::Tsumo { .. }));
+
+        bridge.dispatch(&action_msg(
+            ACTION_AN_GANG_ADD_GANG,
+            json!({ "seat": 1, "type": 3, "tiles": "9s" }),
+        ));
+        let events = bridge.dispatch(&action_msg(
+            ACTION_DEAL_TILE,
+            json!({ "seat": 1, "tile": "", "doras": ["1z", "4z", "5z"] }),
+        ));
+        assert_eq!(events.len(), 3);
+        match (&events[0], &events[1]) {
+            (
+                MjaiEvent::Dora { dora_marker: first },
+                MjaiEvent::Dora {
+                    dora_marker: second,
+                },
+            ) => {
+                assert_eq!(first, "N");
+                assert_eq!(second, "P");
+            }
+            other => panic!("expected two Dora events first, got {other:?}"),
+        }
+        assert!(matches!(events[2], MjaiEvent::Tsumo { .. }));
+
+        let events = bridge.dispatch(&action_msg(
+            ACTION_DISCARD_TILE,
+            json!({ "seat": 1, "tile": "1m", "moqie": true, "doras": ["1z", "4z", "5z"] }),
+        ));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], MjaiEvent::Dahai { .. }));
+        assert_eq!(
+            bridge.doras,
+            vec!["E".to_string(), "N".to_string(), "P".to_string()]
+        );
+    }
+
+    /// If the local list somehow falls several markers behind, every
+    /// missing entry is emitted in order and the list fully resyncs.
+    #[test]
+    fn consume_new_doras_emits_all_missing_markers() {
+        let mut bridge = MajsoulBridge::new(None, None);
+        bridge.seat = Some(0);
+        bridge.doras = vec!["E".to_string()];
+
+        let events = bridge.dispatch(&action_msg(
+            ACTION_DEAL_TILE,
+            json!({ "seat": 0, "tile": "1p", "doras": ["1z", "2z", "3z"] }),
+        ));
+        // No kan pending → warn-and-emit-before-tsumo path.
+        assert_eq!(events.len(), 3);
+        match (&events[0], &events[1]) {
+            (
+                MjaiEvent::Dora { dora_marker: first },
+                MjaiEvent::Dora {
+                    dora_marker: second,
+                },
+            ) => {
+                assert_eq!(first, "S");
+                assert_eq!(second, "W");
+            }
+            other => panic!("expected two Dora events first, got {other:?}"),
+        }
+        assert!(matches!(events[2], MjaiEvent::Tsumo { .. }));
+        assert_eq!(
+            bridge.doras,
+            vec!["E".to_string(), "S".to_string(), "W".to_string()]
+        );
+    }
+
+    /// Defensive: an ankan whose ActionAnGangAddGang already carries the
+    /// grown `doras` array flips right after the ankan event, and the
+    /// rinshan deal repeating the same array must not double-emit.
+    #[test]
+    fn ankan_dora_on_kan_message_emits_once() {
+        let mut bridge = MajsoulBridge::new(None, None);
+        bridge.seat = Some(1);
+        bridge.doras = vec!["E".to_string()];
+
+        let events = bridge.dispatch(&action_msg(
+            ACTION_AN_GANG_ADD_GANG,
+            json!({ "seat": 1, "type": 3, "tiles": "1z", "doras": ["1z", "2z"] }),
+        ));
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], MjaiEvent::Ankan { .. }));
+        match &events[1] {
+            MjaiEvent::Dora { dora_marker } => assert_eq!(dora_marker, "S"),
+            other => panic!("expected Dora after Ankan, got {other:?}"),
+        }
+        assert!(bridge.dora_timing.is_none());
+
+        let events = bridge.dispatch(&action_msg(
+            ACTION_DEAL_TILE,
+            json!({ "seat": 1, "tile": "5p", "doras": ["1z", "2z"] }),
+        ));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], MjaiEvent::Tsumo { .. }));
+    }
+
+    /// 3p: after a kakan the declarer may pull North instead of
+    /// discarding — the babei is then the commit event carrying the kan's
+    /// reveal, which must flip before the kita event.
+    #[test]
+    fn kakan_then_babei_emits_dora_before_kita() {
+        let mut bridge = MajsoulBridge::new(None, None);
+        bridge.seat = Some(0);
+        bridge.num_players = 3;
+        bridge.doras = vec!["E".to_string()];
+
+        bridge.dispatch(&action_msg(
+            ACTION_AN_GANG_ADD_GANG,
+            json!({ "seat": 1, "type": 2, "tiles": "5m" }),
+        ));
+        let events = bridge.dispatch(&action_msg(
+            ACTION_DEAL_TILE,
+            json!({ "seat": 1, "tile": "" }),
+        ));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], MjaiEvent::Tsumo { .. }));
+
+        let events = bridge.dispatch(&action_msg(
+            ACTION_BA_BEI,
+            json!({ "seat": 1, "moqie": false, "doras": ["1z", "4z"], "tingpais": [], "zhenting": false, "tile_state": 0 }),
+        ));
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            MjaiEvent::Dora { dora_marker } => assert_eq!(dora_marker, "N"),
+            other => panic!("expected Dora first, got {other:?}"),
+        }
+        match &events[1] {
+            MjaiEvent::Kita { actor, .. } => assert_eq!(*actor, 1),
+            other => panic!("expected Kita second, got {other:?}"),
+        }
+        assert!(bridge.deferred_doras.is_empty());
     }
 
     /// Riichi declaration: dahai with `is_liqi=true` produces
@@ -3301,8 +4159,7 @@ mod tests {
     }
 
     /// `NotifyGameEndResult` (top-level Notify, NOT ActionPrototype) →
-    /// `[EndGame]`. Final standings live in the flow log; mjai's
-    /// `end_game` carries no payload.
+    /// `[EndGame]`. Standings remain private metadata; mjai JSON stays empty.
     #[test]
     fn notify_game_end_result_emits_end_game() {
         let mut bridge = MajsoulBridge::new(None, None);
@@ -3323,17 +4180,41 @@ mod tests {
         };
         let events = bridge.dispatch(&msg);
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], MjaiEvent::EndGame));
+        assert!(matches!(
+            &events[0],
+            MjaiEvent::EndGame {
+                reason: crate::schema::GameEndReason::Confirmed,
+                final_scores: Some(scores),
+                final_ranks: Some(ranks),
+            } if scores == &[20500, 43800, 11000, 24700]
+                && ranks == &[3, 1, 4, 2]
+        ));
+        assert_eq!(
+            serde_json::to_string(&events[0]).unwrap(),
+            r#"{"type":"end_game"}"#
+        );
     }
 
-    /// State must reset on a new kyoku — a stray `deferred_dora` from the
+    #[test]
+    fn notify_game_terminate_emits_non_finalising_end_game() {
+        let mut bridge = MajsoulBridge::new(None, None);
+        let events = bridge.dispatch(&ParsedMessage {
+            msg_type: MessageType::Notify,
+            msg_id: None,
+            method_name: Arc::from(METHOD_NOTIFY_GAME_TERMINATE),
+            payload: json!({ "reason": "client left game" }),
+        });
+        assert_eq!(events, vec![MjaiEvent::terminated_game()]);
+    }
+
+    /// State must reset on a new kyoku — stray `deferred_doras` from the
     /// previous round can't leak into the next.
     #[test]
     fn start_kyoku_resets_dora_state() {
         let mut bridge = MajsoulBridge::new(None, None);
         bridge.seat = Some(0);
         bridge.dora_timing = Some(DoraTiming::PendingBeforeRinshan);
-        bridge.deferred_dora = Some("S".into());
+        bridge.deferred_doras = vec!["S".into()];
 
         bridge.dispatch(&new_round_msg(json!({
             "doras": ["1m"],
@@ -3344,7 +4225,185 @@ mod tests {
             ],
         })));
         assert!(bridge.dora_timing.is_none());
-        assert!(bridge.deferred_dora.is_none());
+        assert!(bridge.deferred_doras.is_empty());
         assert_eq!(bridge.doras, vec!["1m".to_string()]);
+    }
+
+    // ---------------------------------------------------------------
+    // Time budget (autoplay::budget) extraction
+    // ---------------------------------------------------------------
+
+    fn budget_bridge(seat: Actor) -> (MajsoulBridge, crate::autoplay::budget::SharedTimeBudget) {
+        let slot = crate::autoplay::budget::new_shared();
+        let mut bridge = MajsoulBridge::new(None, None).with_time_budget(Some(slot.clone()));
+        bridge.seat = Some(seat);
+        (bridge, slot)
+    }
+
+    /// An operation list addressed to our seat fills the shared budget
+    /// slot with the wire values (milliseconds).
+    #[test]
+    fn budget_written_from_our_seat_operation() {
+        let (mut bridge, slot) = budget_bridge(2);
+        bridge.dispatch(&action_msg(
+            "ActionDealTile",
+            json!({
+                "seat": 2,
+                "tile": "1m",
+                "operation": { "seat": 2, "time_fixed": 5000, "time_add": 20000 },
+            }),
+        ));
+        let b = slot.read().unwrap().expect("budget must be written");
+        assert_eq!(b.fixed_ms, 5000);
+        assert_eq!(b.add_ms, 20000);
+        assert_eq!(b.source, crate::autoplay::budget::BudgetSource::DealTile);
+        assert!(b.elapsed_ms() < 1000, "opened_at must be fresh");
+    }
+
+    /// An action with no operation list closes the window: the slot is
+    /// cleared, not left holding the previous window's budget.
+    #[test]
+    fn budget_cleared_when_no_operation() {
+        let (mut bridge, slot) = budget_bridge(2);
+        bridge.dispatch(&action_msg(
+            "ActionDealTile",
+            json!({
+                "seat": 2,
+                "tile": "1m",
+                "operation": { "seat": 2, "time_fixed": 5000, "time_add": 0 },
+            }),
+        ));
+        assert!(slot.read().unwrap().is_some());
+
+        // Another seat draws; no operation for us. `operation` arrives as
+        // JSON null on such frames (skip_default_fields(false)).
+        bridge.dispatch(&action_msg(
+            "ActionDealTile",
+            json!({ "seat": 0, "tile": "", "operation": null }),
+        ));
+        assert!(
+            slot.read().unwrap().is_none(),
+            "slot must be cleared when no window is open"
+        );
+    }
+
+    /// Defensive: an operation list addressed to a different seat (the
+    /// server never sends these today) must not be treated as our budget.
+    #[test]
+    fn budget_ignores_other_seat_operation() {
+        let (mut bridge, slot) = budget_bridge(2);
+        bridge.dispatch(&action_msg(
+            "ActionDealTile",
+            json!({
+                "seat": 1,
+                "tile": "",
+                "operation": { "seat": 1, "time_fixed": 5000, "time_add": 0 },
+            }),
+        ));
+        assert!(slot.read().unwrap().is_none());
+    }
+
+    /// Regression: a `GameRestore` replay must not clobber the live slot
+    /// with each historical window. Only the window still open at the end
+    /// of the replay is committed, with `opened_at` backdated by
+    /// `passed_waiting_time` so the delay model knows how much of the
+    /// window is already gone.
+    ///
+    /// `SYNC_GAME_SAMPLE`'s final action (step 31) is our seat-3 draw
+    /// carrying `operation { seat: 3, time_fixed: 300000 }`, and the
+    /// restore reports `passed_waiting_time: 16`.
+    #[test]
+    fn game_restore_commits_only_final_window_backdated() {
+        let slot = crate::autoplay::budget::new_shared();
+        let mut bridge = seated_for_sample().with_time_budget(Some(slot.clone()));
+
+        // Pretend a stale window from before the disconnect is in the slot.
+        *slot.write().unwrap() = Some(TimeBudget {
+            fixed_ms: 1,
+            add_ms: 1,
+            opened_at: Instant::now(),
+            source: BudgetSource::DiscardTile,
+        });
+
+        let payload: JsonValue = serde_json::from_str(SYNC_GAME_SAMPLE).unwrap();
+        bridge.dispatch(&resp(METHOD_SYNC_GAME, payload));
+
+        let b = slot
+            .read()
+            .unwrap()
+            .expect("final window must be committed");
+        assert_eq!(b.fixed_ms, 300_000, "wire value of the final window");
+        assert_eq!(b.source, BudgetSource::DealTile);
+        assert!(
+            b.elapsed_ms() >= 16_000,
+            "opened_at must be backdated by passed_waiting_time (got {}ms)",
+            b.elapsed_ms()
+        );
+        assert!(!bridge.replaying, "replay flag must be reset");
+    }
+
+    /// Regression: chankan / babei windows (`ActionAnGangAddGang`,
+    /// `ActionBaBei`) carry an operation too — they must fill the slot,
+    /// not fall through and clear it.
+    #[test]
+    fn budget_covers_kan_and_babei_windows() {
+        let (mut bridge, slot) = budget_bridge(2);
+        bridge.dispatch(&action_msg(
+            "ActionAnGangAddGang",
+            json!({
+                "seat": 0,
+                "tiles": "1m",
+                "type": 2,
+                "operation": { "seat": 2, "time_fixed": 5000, "time_add": 0 },
+            }),
+        ));
+        let b = slot
+            .read()
+            .unwrap()
+            .expect("chankan window must fill the slot");
+        assert_eq!(
+            b.source,
+            crate::autoplay::budget::BudgetSource::AnGangAddGang
+        );
+    }
+
+    /// Regression: `time_fixed == 0` has unknown semantics (possibly an
+    /// unlimited room) — treat as no budget instead of creating a
+    /// zero-width window that floors every delay.
+    #[test]
+    fn budget_zero_fixed_time_means_no_budget() {
+        let (mut bridge, slot) = budget_bridge(2);
+        bridge.dispatch(&action_msg(
+            "ActionDealTile",
+            json!({
+                "seat": 2,
+                "tile": "1m",
+                "operation": { "seat": 2, "time_fixed": 0, "time_add": 20000 },
+            }),
+        ));
+        assert!(slot.read().unwrap().is_none());
+    }
+
+    /// New-game boundaries clear the slot: authGame response and
+    /// NotifyGameEndResult.
+    #[test]
+    fn budget_cleared_at_game_boundaries() {
+        let (mut bridge, slot) = budget_bridge(2);
+        bridge.dispatch(&action_msg(
+            "ActionDealTile",
+            json!({
+                "seat": 2,
+                "tile": "1m",
+                "operation": { "seat": 2, "time_fixed": 5000, "time_add": 0 },
+            }),
+        ));
+        assert!(slot.read().unwrap().is_some());
+        bridge.dispatch(&ParsedMessage {
+            msg_type: MessageType::Notify,
+            msg_id: None,
+            method_name: Arc::from(METHOD_NOTIFY_GAME_END_RESULT),
+            payload: json!({ "result": {} }),
+        });
+        assert!(slot.read().unwrap().is_none());
     }
 }

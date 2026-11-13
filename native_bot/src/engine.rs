@@ -88,6 +88,11 @@ pub struct Decision {
     pub candidates: Vec<(BotAction, f32)>,
     /// Raw action logits (indexed by the mode's action space).
     pub logits: Vec<f32>,
+    /// The full legal set (before the top-N cut in `candidates`) held exactly
+    /// one action, so this "decision" is forced — any policy, local or remote,
+    /// can only play `action`. Callers that pay per query (the online API) use
+    /// this to answer locally instead of spending a call on a foregone move.
+    pub forced: bool,
 }
 
 enum Backend {
@@ -134,12 +139,8 @@ impl Engine {
     pub fn reset(&mut self) {
         let rule = GameRule::default_tenhou();
         match &mut self.backend {
-            Backend::Four { state, .. } => {
-                *state = Box::new(GameState::new(0, true, None, 0, rule))
-            }
-            Backend::Three { state, .. } => {
-                *state = Box::new(GameState3P::new(0, true, None, 0, rule))
-            }
+            Backend::Four { state, .. } => **state = GameState::new(0, true, None, 0, rule),
+            Backend::Three { state, .. } => **state = GameState3P::new(0, true, None, 0, rule),
         }
     }
 
@@ -167,12 +168,28 @@ impl Engine {
     /// log's `nukidora` has to be renamed to `kita` *before* serde sees it, or
     /// it deserializes into `MjaiEvent::Other` and the event is lost.
     pub fn feed(&mut self, ev: MjaiEvent) {
+        // The chankan check needs the kakan's actor/tile after the event is
+        // applied — `apply_mjai_event` consumes it.
+        let opponent_kakan = match &ev {
+            MjaiEvent::Kakan { actor, pai } if *actor as u8 != self.seat => {
+                Some((*actor as u8, pai.clone()))
+            }
+            _ => None,
+        };
         match &mut self.backend {
-            Backend::Four { state, .. } => state.apply_mjai_event(ev),
+            Backend::Four { state, .. } => {
+                state.apply_mjai_event(ev);
+                if let Some((actor, pai)) = opponent_kakan {
+                    crate::chankan::open_on_kakan(state, actor, &pai, self.seat);
+                }
+            }
             Backend::Three { state, .. } => {
                 let mut ev = ev;
                 sanitize_3p(&mut ev);
-                state.apply_mjai_event(ev)
+                state.apply_mjai_event(ev);
+                if let Some((actor, pai)) = opponent_kakan {
+                    crate::chankan::open_on_kakan_3p(state, actor, &pai, self.seat);
+                }
             }
         }
     }
@@ -195,7 +212,8 @@ impl Engine {
     /// legal action (not our turn / nothing to respond to).
     pub fn decide(&mut self) -> Result<Option<Decision>> {
         let seat = self.seat;
-        let (mut ranked, logits, last_discarder, drawn, reach_pai) = match &mut self.backend {
+        let (mut ranked, logits, last_discarder, drawn, reach_pai, forced) = match &mut self.backend
+        {
             Backend::Four { state, model } => {
                 // `last_discard` is `(discarder_pid, tile)`.
                 let last_discarder = state.last_discard.map(|(pid, _tile)| pid);
@@ -204,6 +222,9 @@ impl Engine {
                 if legal.is_empty() {
                     return Ok(None);
                 }
+                // Forced ⇔ the *legal* set is a singleton — `ranked` is cut to
+                // SHOW_TOP_N below, so its length can't be used for this.
+                let forced = legal.len() == 1;
                 let logits = model.forward_logits(&obs)?;
                 let ranked = rank_by_logits(&legal, &logits, 4, SHOW_TOP_N);
                 let Some((top, _)) = ranked.first() else {
@@ -214,7 +235,7 @@ impl Engine {
                 } else {
                     None
                 };
-                (ranked, logits, last_discarder, drawn, reach_pai)
+                (ranked, logits, last_discarder, drawn, reach_pai, forced)
             }
             Backend::Three { state, model } => {
                 let last_discarder = state.last_discard.map(|(pid, _tile)| pid);
@@ -223,6 +244,7 @@ impl Engine {
                 if legal.is_empty() {
                     return Ok(None);
                 }
+                let forced = legal.len() == 1;
                 let logits = model.forward_logits(&obs)?;
                 let ranked = rank_by_logits(&legal, &logits, 3, SHOW_TOP_N);
                 let Some((top, _)) = ranked.first() else {
@@ -233,7 +255,7 @@ impl Engine {
                 } else {
                     None
                 };
-                (ranked, logits, last_discarder, drawn, reach_pai)
+                (ranked, logits, last_discarder, drawn, reach_pai, forced)
             }
         };
 
@@ -256,6 +278,7 @@ impl Engine {
             action,
             candidates,
             logits,
+            forced,
         }))
     }
 

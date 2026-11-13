@@ -3,16 +3,26 @@ mod bot;
 mod capture;
 mod general;
 mod logging;
+mod merge;
+mod network;
+mod overlay;
 mod platform;
 mod proxy;
+mod range;
 
-pub use autoplay::{AutoplayConfig, MajsoulAutoplayConfig};
+pub use autoplay::{
+    AutoplayConfig, DelayDistribution, DelayMode, DelayModelConfig, MajsoulAutoplayConfig,
+};
 pub use bot::{BotConfig, NativeApiConfig};
-pub use capture::{CaptureConfig, CaptureMode, ChromiumConfig};
+pub use capture::{CaptureConfig, CaptureMode, ChromiumConfig, HttpCaptureConfig};
 pub use general::GeneralConfig;
 pub use logging::LoggingConfig;
+pub use merge::merge_into;
+pub use network::{GithubMirrorMode, NetworkConfig};
+pub use overlay::{OverlayConfig, TOP_N_MAX, TOP_N_MIN};
 pub use platform::{Platform, PlatformConfig};
 pub use proxy::ProxyConfig;
+pub use range::MsRange;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -27,6 +37,8 @@ pub struct AppConfig {
     pub bot: BotConfig,
     pub capture: CaptureConfig,
     pub autoplay: AutoplayConfig,
+    pub overlay: OverlayConfig,
+    pub network: NetworkConfig,
 }
 
 enum ResolvedPath {

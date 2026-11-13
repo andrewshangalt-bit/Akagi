@@ -23,7 +23,10 @@
 //! - **Gating** — the API's rate limits are low, and calling on every opponent
 //!   discard "just in case" roughly triples the request count. So we run the
 //!   local model's cheap legal-action check first and only hit the network when
-//!   our seat genuinely has a move to make.
+//!   our seat genuinely has a move to make. Forced moves — a legal set of
+//!   exactly one action, e.g. every tsumogiri while riichi — are answered
+//!   locally too: the server could not pick anything else, so the call would
+//!   spend quota to learn nothing.
 //! - **Fallback** — if the server is unreachable, rate-limited, or the key is
 //!   invalid, we play the local model's action so a live game never stalls.
 //! - **Circuit breaker** — after a failed call the API is skipped for a growing
@@ -166,8 +169,13 @@ struct ApiSession {
     client: ApiClient,
     base_url: String,
     key: String,
+    /// Proxy URL the client was built with; part of the rebuild key.
+    proxy: String,
     /// Model id to request; empty ⇒ let the server pick its game default.
     model: String,
+    /// Raw `react_timeout_ms` the client's react timeout was built from; part
+    /// of the rebuild key so editing the timeout re-applies on the next move.
+    react_timeout_ms: u32,
 }
 
 pub struct NativeBot {
@@ -188,6 +196,11 @@ pub struct NativeBot {
     notify_tx: NotifyBus,
     /// `Some` while cloud inference is configured (`enabled` + URL + key).
     api: Option<ApiSession>,
+    /// The (base_url, key, proxy, model) tuple that last failed client build
+    /// (e.g. an invalid proxy URL). Re-read every decision, so without this
+    /// the same broken config would re-attempt and re-toast on every move;
+    /// with it, the warning fires once until the user actually edits something.
+    api_failed: Option<(String, String, String, String)>,
     breaker: Breaker,
 }
 
@@ -210,6 +223,7 @@ impl NativeBot {
             stream: Vec::new(),
             notify_tx,
             api: None,
+            api_failed: None,
             breaker: Breaker::new(),
         })
     }
@@ -223,6 +237,7 @@ impl NativeBot {
     /// rather than after the current backoff window.
     fn apply_api_config(&mut self, cfg: &NativeApiConfig, announce: Announce) {
         if !cfg.is_active() {
+            self.api_failed = None;
             if self.api.take().is_some() {
                 self.breaker.reset();
                 self.notify(
@@ -237,23 +252,45 @@ impl NativeBot {
 
         let base_url = cfg.base_url.trim();
         let key = cfg.key.trim();
+        // Collapses the on/off toggle into the effective value, so flipping
+        // `proxy_enabled` alone changes this and rebuilds the client.
+        let proxy = cfg.effective_proxy();
         let model = cfg.model_for(self.num_players).trim().to_string();
-        let unchanged = self
-            .api
-            .as_ref()
-            .is_some_and(|s| s.base_url == base_url && s.key == key && s.model == model);
+        // Raw ms is the rebuild key (round-trips the user's exact value); the
+        // clamped Duration is what the client is actually built with.
+        let react_timeout_ms = cfg.react_timeout_ms;
+        let unchanged = self.api.as_ref().is_some_and(|s| {
+            s.base_url == base_url
+                && s.key == key
+                && s.proxy == proxy
+                && s.model == model
+                && s.react_timeout_ms == react_timeout_ms
+        });
         if unchanged {
+            return;
+        }
+        // This exact config already failed to build a client — stay on the
+        // local model quietly instead of re-attempting (and re-toasting) on
+        // every decision. Any edit to the config clears the tombstone below.
+        if self
+            .api_failed
+            .as_ref()
+            .is_some_and(|f| f.0 == base_url && f.1 == key && f.2 == proxy && f.3 == model)
+        {
             return;
         }
 
         let was_off = self.api.is_none();
-        match ApiClient::new(base_url, key) {
+        match ApiClient::new(base_url, key, proxy) {
             Ok(client) => {
+                self.api_failed = None;
                 self.api = Some(ApiSession {
-                    client,
+                    client: client.with_react_timeout(cfg.effective_react_timeout()),
                     base_url: base_url.to_string(),
                     key: key.to_string(),
+                    proxy: proxy.to_string(),
                     model: model.clone(),
+                    react_timeout_ms,
                 });
                 self.breaker.reset();
                 let body = if model.is_empty() {
@@ -275,10 +312,17 @@ impl NativeBot {
             }
             Err(e) => {
                 // Building the HTTP client failed — retrying won't help, so drop
-                // to the local model rather than opening a breaker window.
+                // to the local model rather than opening a breaker window, and
+                // remember the rejected config so this warns once, not per move.
                 let msg = format!("{e:#}");
                 warn!("native API: client setup failed ({msg}); using the local model");
                 self.api = None;
+                self.api_failed = Some((
+                    base_url.to_string(),
+                    key.to_string(),
+                    proxy.to_string(),
+                    model.clone(),
+                ));
                 self.notify(
                     Notification::warn("Cloud inference unavailable")
                         .body(msg)
@@ -364,12 +408,33 @@ impl NativeBot {
             Ok(resp) => {
                 self.breaker.record_success();
                 self.record_health(true, None);
+                let title = api_show_title(
+                    resp.model.as_deref(),
+                    self.api.as_ref().map(|s| s.model.as_str()),
+                );
                 match resp.reaction {
-                    Some(reaction) => match self.resolve_reaction(reaction, &resp.candidates).await
+                    Some(reaction) => match self
+                        .resolve_reaction(reaction, &resp.candidates, &title)
+                        .await
                     {
                         Some(pair) => pair,
                         None => local_reply(local, self.seat),
                     },
+                    None if null_is_ranked_pass(
+                        local,
+                        self.seat,
+                        &self.stream,
+                        &resp.candidates,
+                    ) =>
+                    {
+                        // A pass needs no tile payload. Some compatible servers
+                        // rank `none` but omit the redundant exact reaction;
+                        // retain their probabilities instead of replacing the
+                        // result with the local model's card.
+                        let pass = MjaiEvent::None;
+                        let meta = build_show_meta_mjai(&pass, &resp.candidates, &title);
+                        (pass, meta)
+                    }
                     None => {
                         // Server sees no legal action though the local gate found
                         // one — a stream mismatch. Play the local move rather than
@@ -402,6 +467,7 @@ impl NativeBot {
         &mut self,
         reaction: Value,
         candidates: &[Candidate],
+        title: &str,
     ) -> Option<(MjaiEvent, Option<Value>)> {
         let mut ev: MjaiEvent = serde_json::from_value(reaction).ok()?;
         set_actor(&mut ev, self.seat);
@@ -426,7 +492,7 @@ impl NativeBot {
                 None => return None,
             }
         }
-        let meta = build_show_meta_mjai(&ev, candidates);
+        let meta = build_show_meta_mjai(&ev, candidates, title);
         Some((ev, meta))
     }
 
@@ -489,11 +555,29 @@ impl BotRunner for NativeBot {
             }
         }
 
-        // Local gate: no legal action ⇒ don't spend an API call (and don't
-        // pester the server with the opponent-discard windows we can't act on).
+        // These events close or postpone a decision; they do not open one.
+        // BotManager normally buffers them, but guard direct BotRunner users as
+        // well because riichienv may retain the preceding legal-action set.
+        let waits_for_rinshan = matches!(
+            events.last(),
+            Some(
+                MjaiEvent::Daiminkan { actor, .. }
+                    | MjaiEvent::Ankan { actor, .. }
+                    | MjaiEvent::Kakan { actor, .. }
+            ) if *actor == self.seat
+        );
+        if matches!(events.last(), Some(MjaiEvent::ReachAccepted { .. })) || waits_for_rinshan {
+            return Ok(BotResponse {
+                action: MjaiEvent::None,
+                meta: None,
+            });
+        }
+
+        // Local gate: nothing to decide ⇒ reply `none`, spend no API call, and
+        // leave whatever card is on screen alone.
         let local = match self.engine.decide()? {
-            Some(d) => d,
-            None => {
+            Some(d) if is_decision_point(&d.candidates) => d,
+            _ => {
                 return Ok(BotResponse {
                     action: MjaiEvent::None,
                     meta: None,
@@ -507,7 +591,11 @@ impl BotRunner for NativeBot {
         let cfg = self.config.read().await.bot.api.clone();
         self.apply_api_config(&cfg, Announce::ToUser);
 
-        let (action, meta) = if self.api.is_some() && self.breaker.allows() {
+        // A forced move (the legal set is a singleton — e.g. tsumogiri while
+        // riichi) has only one possible answer, so asking the server would
+        // spend a metered API call to learn nothing. Answer it locally.
+        let use_api = self.api.is_some() && self.breaker.allows() && !local.forced;
+        let (action, meta) = if use_api {
             self.remote_decision(&local).await
         } else {
             local_reply(&local, self.seat)
@@ -523,6 +611,53 @@ impl BotRunner for NativeBot {
     }
 }
 
+/// Did the bot actually choose anything here?
+///
+/// This is the precondition for touching the HUD card: it must change when the
+/// bot made a choice, and *only* then. A real decision has something to choose
+/// between — our own turn (a discard, riichi, kan, tsumo…), or a call window
+/// where a pon / chi / kan / ron sits next to the pass.
+///
+/// Two things are not decisions. An empty legal set, obviously. And a legal set
+/// of exactly `[Pass]`: the engine offers `Pass` unconditionally in its response
+/// phase, so a seat standing in someone *else's* call window still gets one
+/// handed back. Rendering that as "Pass 100%" would replace real advice with a
+/// choice the bot never had.
+///
+/// The bare-`[Pass]` case is not reachable in live play today — the bridge feeds
+/// opponents' hands as `?`, so the engine can only ever see *our* claims, and it
+/// only opens a response window when a claim exists, which means the pass always
+/// arrives next to the call it was weighed against. But that is a fact about
+/// what the engine currently knows, not about what the card promises. Encode the
+/// promise.
+fn is_decision_point(candidates: &[(BotAction, f32)]) -> bool {
+    !matches!(candidates, [] | [(BotAction::Pass, _)])
+}
+
+/// Whether a null reaction still identifies an unambiguous cloud pass.
+/// Restrict recovery to response windows so an own-turn null can never suppress
+/// a required discard.
+fn null_is_ranked_pass(
+    local: &Decision,
+    seat: u8,
+    stream: &[MjaiEvent],
+    candidates: &[Candidate],
+) -> bool {
+    let response_event = matches!(
+        stream.last(),
+        Some(MjaiEvent::Dahai { actor, .. } | MjaiEvent::Kakan { actor, .. })
+            if *actor != seat
+    );
+    response_event
+        && local
+            .candidates
+            .iter()
+            .any(|(action, _)| matches!(action, BotAction::Pass))
+        && candidates
+            .first()
+            .is_some_and(|candidate| candidate.action == "none")
+}
+
 /// Build the reply pair (mjai action + HUD card) from the local model's
 /// decision — the fallback when the API path is unavailable.
 fn local_reply(local: &Decision, seat: u8) -> (MjaiEvent, Option<Value>) {
@@ -533,7 +668,12 @@ fn local_reply(local: &Decision, seat: u8) -> (MjaiEvent, Option<Value>) {
 /// Shape the accumulated Akagi mjai stream into the API's expected JSON:
 /// censor other seats' hidden info to `?`, pad 3p `start_game`/`start_kyoku`
 /// arrays to length 4, strip player-count / predicted-reach extensions.
-fn build_api_events(stream: &[MjaiEvent], seat: u8, num_players: u8) -> Vec<Value> {
+///
+/// `pub(crate)` because the whole-game review submit
+/// (`crate::ipc::commands::native_api_review_history_game`) reuses it: a
+/// recorded history log is the same bridge stream this bot accumulates live,
+/// and `/v3/review` wants the identical censored perspective as `/v3/react`.
+pub(crate) fn build_api_events(stream: &[MjaiEvent], seat: u8, num_players: u8) -> Vec<Value> {
     stream
         .iter()
         .map(|ev| to_api_event(ev, seat, num_players))
@@ -647,10 +787,41 @@ fn with_lead(lead: &str, rest: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Card title for a decision the embedded local model served. The two title
+/// forms (this and [`api_show_title`]) let the HUD say, per decision, which
+/// inference path actually produced the move — the API silently falls back to
+/// the local model, so the source can flip mid-game.
+const SHOW_TITLE_LOCAL: &str = "Akagi · Local";
+
+/// Row label for declining a call. Both inference paths use it, so the card
+/// reads the same whichever one answered. "None" — the mjai wire word — is
+/// accurate and useless: on a call window what the player wants to read is
+/// "Pass 87%" against "Pon 13%", not "None 87%".
+const PASS_LABEL: &str = "Pass";
+
+/// Card title for a decision the online API served: name the model. The
+/// server's own report (which model actually answered) wins over the
+/// configured id — the config may be empty, meaning "server default".
+fn api_show_title(served: Option<&str>, configured: Option<&str>) -> String {
+    let model = [served, configured]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|m| !m.is_empty());
+    match model {
+        Some(m) => format!("Akagi · {m}"),
+        None => "Akagi · Online".to_string(),
+    }
+}
+
 /// HUD "Bot Show" card for the API path: the first row is the exact chosen move
 /// (precise tiles), the rest are the server's runner-up **candidate** labels,
 /// each with its probability — so the card shows the model's top-N.
-fn build_show_meta_mjai(ev: &MjaiEvent, candidates: &[Candidate]) -> Option<serde_json::Value> {
+fn build_show_meta_mjai(
+    ev: &MjaiEvent,
+    candidates: &[Candidate],
+    title: &str,
+) -> Option<serde_json::Value> {
     let mut items: Vec<Value> = Vec::new();
     // Row 0: the exact reaction (precise tiles), prob from the top candidate.
     if let Some((label, pais)) = label_pais_mjai(ev) {
@@ -664,7 +835,7 @@ fn build_show_meta_mjai(ev: &MjaiEvent, candidates: &[Candidate]) -> Option<serd
             items.push(make_show_item(label, &pais, Some(c.prob)));
         }
     }
-    wrap_show(items)
+    wrap_show(items, title)
 }
 
 /// Label + tiles for a resolved mjai reaction (the exact chosen move).
@@ -683,7 +854,7 @@ fn label_pais_mjai(ev: &MjaiEvent) -> Option<(&'static str, Vec<String>)> {
         // Passing IS the chosen move on a call window (pon/chi/kan/ron
         // offered, model declines) — show it, or the card would render only
         // the runner-ups and read as recommending the call it just declined.
-        MjaiEvent::None => ("None", vec![]),
+        MjaiEvent::None => (PASS_LABEL, vec![]),
         _ => return None,
     };
     Some(out)
@@ -705,37 +876,67 @@ fn label_pais_candidate(action: &str) -> Option<(&'static str, Vec<String>)> {
         "ryukyoku" => ("Ryukyoku", vec![]),
         "nukidora" => ("Kita", vec!["N".into()]),
         // On a call window the pass option is half the decision (e.g. pon 55%
-        // vs none 45%) — a real ranked row, not noise.
-        "none" => ("None", vec![]),
+        // vs pass 45%) — a real ranked row, not noise.
+        "none" => (PASS_LABEL, vec![]),
         // Unknown future labels are not shown as a row.
         _ => return None,
     };
     Some(out)
 }
 
-/// Build one `show.items` entry: a label, optional tiles, optional probability
-/// (rendered as a whole-percent string).
+/// The mjai event type a `show.items` row stands for, where its label names
+/// exactly one. `Kan` does not (it is a daiminkan on one path and any kan on
+/// the API's coarse candidate list), so it carries none. Read by
+/// `autoplay::delay::probs::candidates` to tell a runner-up discard from a
+/// button; the HUD ignores it.
+fn show_type(label: &str) -> Option<&'static str> {
+    Some(match label {
+        "Discard" => "dahai",
+        "Riichi" => "reach",
+        "Pon" => "pon",
+        "Chi" => "chi",
+        "Ankan" => "ankan",
+        "Kakan" => "kakan",
+        "Hora" => "hora",
+        "Ryukyoku" => "ryukyoku",
+        "Kita" => "kita",
+        PASS_LABEL => "none",
+        _ => return None,
+    })
+}
+
+/// Build one `show.items` entry: a label, its mjai `type` where the label
+/// names one, optional tiles, optional probability (rendered as a
+/// whole-percent string).
 fn make_show_item(label: &str, pais: &[String], prob: Option<f64>) -> Value {
     use serde_json::json;
     let mut item = serde_json::Map::new();
     item.insert("label".into(), json!(label));
+    if let Some(kind) = show_type(label) {
+        item.insert("type".into(), json!(kind));
+    }
     if pais.iter().any(|p| !p.is_empty()) {
         item.insert("pais".into(), json!(pais));
     }
     if let Some(p) = prob {
         item.insert("value".into(), json!(format!("{:.0}%", p * 100.0)));
+        // Raw probability for machine consumers (`autoplay::delay::probs`);
+        // the formatted `value` above only has integer-percent resolution.
+        item.insert("prob".into(), json!(p));
     }
     Value::Object(item)
 }
 
 /// Wrap `items` in the `{ "show": { title, items } }` envelope, or `None` when
-/// there is nothing to show.
-fn wrap_show(items: Vec<Value>) -> Option<Value> {
+/// there is nothing to show. The title names the inference source (see
+/// [`SHOW_TITLE_LOCAL`] / [`api_show_title`]); the frontend renders it as the
+/// Bot Show tile's header.
+fn wrap_show(items: Vec<Value>, title: &str) -> Option<Value> {
     use serde_json::json;
     if items.is_empty() {
         return None;
     }
-    Some(json!({ "show": { "title": "Akagi", "items": items } }))
+    Some(json!({ "show": { "title": title, "items": items } }))
 }
 
 fn take_n<const N: usize>(v: Vec<String>) -> [String; N] {
@@ -745,26 +946,30 @@ fn take_n<const N: usize>(v: Vec<String>) -> [String; N] {
 
 /// Build the HUD "Bot Show" recommendation card (`meta.show`) from the ranked
 /// candidates, so the built-in bot surfaces its **top-N** suggestions (each with
-/// its policy probability) like other bots. `None` when the top choice is a pass
-/// (nothing to recommend — the previous card stays).
+/// its policy probability) like other bots.
+///
+/// Every candidate becomes a row, the pass included. Declining a call *is* the
+/// decision on a call window, and its probability is the most interesting number
+/// on screen at that moment — "Pass 87% / Pon 13%" is the answer to "should I
+/// have ponned?". Suppressing it left the previous turn's discard advice sitting
+/// there, reading as live advice for a decision that was already over.
+///
+/// Callers must have established a decision point first ([`is_decision_point`]);
+/// a lone pass is not one, and must not reach here.
 fn build_show_meta(candidates: &[(BotAction, f32)]) -> Option<serde_json::Value> {
-    // A leading pass means "no action this turn": leave the previous card up.
-    if matches!(candidates.first(), None | Some((BotAction::Pass, _))) {
-        return None;
-    }
     let items: Vec<Value> = candidates
         .iter()
-        .filter_map(|(a, p)| {
-            label_pais_bot_action(a)
-                .map(|(label, pais)| make_show_item(label, &pais, Some(*p as f64)))
+        .map(|(a, p)| {
+            let (label, pais) = label_pais_bot_action(a);
+            make_show_item(label, &pais, Some(*p as f64))
         })
         .collect();
-    wrap_show(items)
+    wrap_show(items, SHOW_TITLE_LOCAL)
 }
 
-/// Label + tiles for one bot action, or `None` for a pass (not shown as a row).
-fn label_pais_bot_action(a: &BotAction) -> Option<(&'static str, Vec<String>)> {
-    let out = match a {
+/// Label + tiles for one bot action.
+fn label_pais_bot_action(a: &BotAction) -> (&'static str, Vec<String>) {
+    match a {
         BotAction::Dahai { pai, .. } => ("Discard", vec![pai.clone()]),
         BotAction::Reach { pai } => (
             "Riichi",
@@ -782,9 +987,10 @@ fn label_pais_bot_action(a: &BotAction) -> Option<(&'static str, Vec<String>)> {
         BotAction::Hora { .. } => ("Hora", vec![]),
         BotAction::Kyushu => ("Ryukyoku", vec![]),
         BotAction::Kita => ("Kita", vec!["N".into()]),
-        BotAction::Pass => return None,
-    };
-    Some(out)
+        // No tiles: the row is about *declining* the discard on the table, and
+        // drawing that tile here would read as a recommendation to play it.
+        BotAction::Pass => (PASS_LABEL, vec![]),
+    }
 }
 
 /// Map a schema-agnostic [`BotAction`] to Akagi's `MjaiEvent` reply.
@@ -875,8 +1081,7 @@ mod tests {
             enabled: true,
             base_url: base_url.to_string(),
             key: key.to_string(),
-            model_4p: String::new(),
-            model_3p: String::new(),
+            ..NativeApiConfig::default()
         }
     }
 
@@ -907,6 +1112,7 @@ mod tests {
             aka_flag: None,
             id: Some(seat),
             num_players: 4,
+            game_meta: None,
         }
     }
 
@@ -931,7 +1137,113 @@ mod tests {
             scores: vec![25000, 25000, 25000, 25000],
             tehais: vec![hand.clone(), hand.clone(), hand.clone(), hand],
             num_players: 4,
+            catch_up: 0,
         }
+    }
+
+    /// A `start_kyoku` shaped like the ones the bridge actually emits: our hand
+    /// is known, the opponents' are `?`. It matters. Handing the engine four
+    /// concrete hands (as `start_kyoku_4p` does, for convenience) lets it see
+    /// claims it can never see in a real game, so a test built on that is
+    /// testing a game we never get to play.
+    fn start_kyoku_4p_hidden(our_hand: [&str; 13]) -> MjaiEvent {
+        // The bridge's placeholder for a tile we cannot see (mjai's `?`).
+        let hidden = vec!["?".to_string(); 13];
+        MjaiEvent::StartKyoku {
+            bakaze: "E".into(),
+            dora_marker: "2m".into(),
+            kyoku: 1,
+            honba: 0,
+            kyotaku: 0,
+            oya: 0,
+            scores: vec![25000; 4],
+            tehais: vec![
+                our_hand.iter().map(|s| s.to_string()).collect(),
+                hidden.clone(),
+                hidden.clone(),
+                hidden,
+            ],
+            num_players: 4,
+            catch_up: 0,
+        }
+    }
+
+    fn seat1_discards(pai: &str) -> [MjaiEvent; 2] {
+        [
+            MjaiEvent::Tsumo {
+                actor: 1,
+                pai: pai.into(),
+            },
+            MjaiEvent::Dahai {
+                actor: 1,
+                pai: pai.into(),
+                tsumogiri: true,
+            },
+        ]
+    }
+
+    /// Regression (#190), end to end. We hold two 9s, seat 1 discards a 9s: a pon
+    /// window. Whatever the model picks, the card must show the pass ranked
+    /// against the pon — that comparison *is* the decision. Before this fix the
+    /// bot emitted no card at all when it declined, so the tile kept displaying
+    /// the previous turn's discard advice as if it were live.
+    #[tokio::test]
+    async fn a_declined_call_still_produces_a_card_ranking_the_pass() {
+        let mut bot = bot_with(cfg_off(), crate::event_bus::notify_bus()).await;
+        let mut events = vec![
+            start_game_4p(0),
+            start_kyoku_4p_hidden([
+                "9s", "9s", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p",
+            ]),
+        ];
+        events.extend(seat1_discards("9s"));
+
+        let resp = bot.react(&events).await.unwrap();
+
+        let meta = resp
+            .meta
+            .as_ref()
+            .expect("a pon window is a decision — it must refresh the card");
+        let items = meta["show"]["items"].as_array().unwrap();
+        let labels: Vec<&str> = items
+            .iter()
+            .map(|i| i["label"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            labels.contains(&"Pass"),
+            "the pass must be a ranked row, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"Pon"),
+            "…alongside the call it is weighed against, got {labels:?}"
+        );
+        assert!(
+            items.iter().all(|i| i["value"].is_string()),
+            "every row carries the probability the player is here to read"
+        );
+    }
+
+    /// The other half of the contract: an opponent discard we cannot call is not
+    /// a decision, so the card must be left exactly as it was.
+    #[tokio::test]
+    async fn an_uncallable_opponent_discard_leaves_the_card_alone() {
+        let mut bot = bot_with(cfg_off(), crate::event_bus::notify_bus()).await;
+        let mut events = vec![
+            start_game_4p(0),
+            // No 9s in hand, and seat 1 is our shimocha so a chi is impossible.
+            start_kyoku_4p_hidden([
+                "1m", "3m", "5m", "7m", "9m", "2p", "4p", "6p", "8p", "1s", "3s", "5s", "7s",
+            ]),
+        ];
+        events.extend(seat1_discards("9s"));
+
+        let resp = bot.react(&events).await.unwrap();
+
+        assert!(matches!(resp.action, MjaiEvent::None));
+        assert!(
+            resp.meta.is_none(),
+            "nothing was decided, so nothing should replace the card on screen"
+        );
     }
 
     #[tokio::test]
@@ -1029,6 +1341,126 @@ mod tests {
         assert!(bot.breaker.allows());
     }
 
+    /// A pass needs no exact tile payload. Compatible servers may rank
+    /// `none` normally while omitting only the redundant reaction object.
+    #[tokio::test]
+    async fn null_reaction_with_ranked_none_recovers_the_cloud_pass() {
+        let (base, served) = mock_http(vec![(
+            "200 OK",
+            r#"{
+                "reaction":null,
+                "candidates":[
+                    {"action":"none","prob":0.73},
+                    {"action":"pon","prob":0.27}
+                ],
+                "model":"4p-cloud"
+            }"#
+            .into(),
+        )]);
+        let mut bot = bot_with(cfg_api(&base), crate::event_bus::notify_bus()).await;
+        let mut events = vec![
+            start_game_4p(0),
+            start_kyoku_4p_hidden([
+                "9s", "9s", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p",
+            ]),
+        ];
+        events.extend(seat1_discards("9s"));
+
+        let resp = bot.react(&events).await.unwrap();
+        assert_eq!(resp.action, MjaiEvent::None);
+        let show = &resp.meta.as_ref().expect("cloud pass card")["show"];
+        assert_eq!(show["title"], "Akagi · 4p-cloud");
+        assert_eq!(show["items"][0]["label"], "Pass");
+        assert_eq!(show["items"][0]["value"], "73%");
+        assert_eq!(show["items"][1]["label"], "Pon");
+        assert_eq!(served.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reach_accepted_does_not_repeat_the_previous_call_window() {
+        let (base, served) = mock_http(vec![(
+            "200 OK",
+            r#"{
+                "reaction":{"type":"none"},
+                "candidates":[
+                    {"action":"none","prob":0.72},
+                    {"action":"pon","prob":0.28}
+                ],
+                "model":"4p-cloud"
+            }"#
+            .into(),
+        )]);
+        let mut bot = bot_with(cfg_api(&base), crate::event_bus::notify_bus()).await;
+        let first = bot
+            .react(&[
+                start_game_4p(0),
+                start_kyoku_4p_hidden([
+                    "9s", "9s", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p",
+                ]),
+                MjaiEvent::Tsumo {
+                    actor: 1,
+                    pai: "9s".into(),
+                },
+                MjaiEvent::Reach {
+                    actor: 1,
+                    pai: None,
+                },
+                MjaiEvent::Dahai {
+                    actor: 1,
+                    pai: "9s".into(),
+                    tsumogiri: true,
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(first.action, MjaiEvent::None);
+        assert!(first.meta.is_some());
+
+        let duplicate = bot
+            .react(&[MjaiEvent::ReachAccepted { actor: 1 }])
+            .await
+            .unwrap();
+        assert_eq!(duplicate.action, MjaiEvent::None);
+        assert!(duplicate.meta.is_none());
+        assert!(bot.breaker.allows());
+        assert_eq!(served.join().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn own_daiminkan_waits_for_rinshan_before_cloud_inference() {
+        let mut bot = bot_with(
+            cfg_api(UNREACHABLE_BASE_URL),
+            crate::event_bus::notify_bus(),
+        )
+        .await;
+        let events = [
+            start_game_4p(0),
+            start_kyoku_4p_hidden([
+                "5m", "5m", "5m", "1m", "2m", "3m", "4p", "5p", "6p", "7s", "8s", "9s", "E",
+            ]),
+            MjaiEvent::Tsumo {
+                actor: 1,
+                pai: "5m".into(),
+            },
+            MjaiEvent::Dahai {
+                actor: 1,
+                pai: "5m".into(),
+                tsumogiri: true,
+            },
+            MjaiEvent::Daiminkan {
+                actor: 0,
+                target: 1,
+                pai: "5m".into(),
+                consumed: ["5m".into(), "5m".into(), "5m".into()],
+            },
+        ];
+
+        let resp = bot.react(&events).await.unwrap();
+        assert_eq!(resp.action, MjaiEvent::None);
+        assert!(resp.meta.is_none());
+        assert!(bot.breaker.allows());
+    }
+
     /// The reach two-step: the server returns a bare `reach`, we re-query with
     /// the reach appended and adopt the discard it names. mjai `reach` must
     /// carry the discard or autoplay stalls.
@@ -1105,6 +1537,94 @@ mod tests {
         assert!(!bot.breaker.allows());
     }
 
+    /// Regression (#227): a forced move — the legal set is a singleton, here
+    /// the tsumogiri after our riichi — must be answered by the local model
+    /// without spending a metered API call: the server could only return the
+    /// same move.
+    ///
+    /// The mock is scripted with zero responses, so its listener is already
+    /// gone when we decide; had the bot tried the network anyway, the refused
+    /// connection would have opened the breaker and toasted a degrade warning.
+    /// Both staying quiet is the proof that no call was even attempted.
+    #[tokio::test]
+    async fn a_forced_move_is_answered_locally_without_an_api_call() {
+        let (base, served) = mock_http(vec![]);
+        let notify = crate::event_bus::notify_bus();
+        let mut rx = notify.subscribe();
+        let mut bot = bot_with(cfg_api(&base), notify).await;
+
+        let mut events = vec![
+            start_game_4p(0),
+            // Closed tenpai: 123m 456m 789m 123p + 4p tanki.
+            start_kyoku_4p_hidden([
+                "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "4p",
+            ]),
+            MjaiEvent::Tsumo {
+                actor: 0,
+                pai: "9s".into(),
+            },
+            // Our riichi, echoed back through the bus as in a live game.
+            MjaiEvent::Reach {
+                actor: 0,
+                pai: None,
+            },
+            MjaiEvent::Dahai {
+                actor: 0,
+                pai: "9s".into(),
+                tsumogiri: true,
+            },
+            MjaiEvent::ReachAccepted { actor: 0 },
+        ];
+        for seat in 1..4u8 {
+            events.push(MjaiEvent::Tsumo {
+                actor: seat,
+                pai: "1z".into(),
+            });
+            events.push(MjaiEvent::Dahai {
+                actor: seat,
+                pai: "1z".into(),
+                tsumogiri: true,
+            });
+        }
+        // Our next draw: not the winning 4p, no kan in sight — discarding the
+        // drawn tile is the only legal action.
+        events.push(MjaiEvent::Tsumo {
+            actor: 0,
+            pai: "9s".into(),
+        });
+
+        let resp = bot.react(&events).await.unwrap();
+        assert_eq!(
+            resp.action,
+            MjaiEvent::Dahai {
+                actor: 0,
+                pai: "9s".into(),
+                tsumogiri: true,
+            },
+            "riichi forces the tsumogiri"
+        );
+        // Answered by the local model…
+        assert_eq!(
+            resp.meta.as_ref().unwrap()["show"]["title"],
+            SHOW_TITLE_LOCAL
+        );
+        // …without touching the network: no request reached the mock, no failed
+        // attempt opened the breaker, no degrade toast reached the user.
+        assert!(
+            bot.breaker.allows(),
+            "a skipped call must not touch the breaker"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a skipped call must not toast the user"
+        );
+        assert_eq!(
+            served.join().unwrap().len(),
+            0,
+            "no API call for a forced move"
+        );
+    }
+
     // ---------- circuit breaker ----------
 
     #[test]
@@ -1149,7 +1669,8 @@ mod tests {
         let (base, served) = mock_http(vec![(
             "200 OK",
             r#"{"reaction":{"type":"dahai","actor":0,"pai":"1m","tsumogiri":false},
-                "candidates":[{"action":"dahai:1m","prob":0.9}]}"#
+                "candidates":[{"action":"dahai:1m","prob":0.9}],
+                "model":"4p-mock"}"#
                 .into(),
         )]);
         let config = cfg_off();
@@ -1165,6 +1686,11 @@ mod tests {
             first.action
         );
         assert!(bot.api.is_none());
+        // ...and the HUD card says the local model played it.
+        assert_eq!(
+            first.meta.as_ref().unwrap()["show"]["title"],
+            SHOW_TITLE_LOCAL
+        );
 
         // The user enables cloud inference mid-kyoku.
         config.write().await.bot.api = api_on(&base, &"k".repeat(32));
@@ -1191,6 +1717,11 @@ mod tests {
             "the server's move must be played"
         );
         assert_eq!(served.join().unwrap().len(), 1, "exactly one API call");
+        // The card title now names the model the server says answered.
+        assert_eq!(
+            second.meta.as_ref().unwrap()["show"]["title"],
+            "Akagi · 4p-mock"
+        );
 
         // ...and the user is told, on the same channel the status LED listens to.
         let n = rx.try_recv().expect("a toast confirming the switch");
@@ -1244,6 +1775,57 @@ mod tests {
         assert_eq!(bot.api.as_ref().unwrap().key, "z".repeat(32));
     }
 
+    #[tokio::test]
+    async fn toggling_the_proxy_flag_rebuilds_with_the_effective_proxy() {
+        let notify = crate::event_bus::notify_bus();
+        // A proxy is typed but the toggle is off: the session must stay direct.
+        let mut cfg = AppConfig::default();
+        cfg.bot.api = api_on(UNREACHABLE_BASE_URL, &"k".repeat(32));
+        cfg.bot.api.proxy = "socks5://127.0.0.1:1080".into();
+        let mut bot = bot_with(Arc::new(RwLock::new(cfg)), notify).await;
+        assert_eq!(
+            bot.api.as_ref().unwrap().proxy,
+            "",
+            "toggle off ⇒ client built direct even with a proxy set"
+        );
+
+        // Flip the toggle on (same URL/key/proxy string): the client rebuilds
+        // and now carries the effective proxy.
+        let mut on = api_on(UNREACHABLE_BASE_URL, &"k".repeat(32));
+        on.proxy = "socks5://127.0.0.1:1080".into();
+        on.proxy_enabled = true;
+        bot.apply_api_config(&on, Announce::ToUser);
+        assert_eq!(
+            bot.api.as_ref().unwrap().proxy,
+            "socks5://127.0.0.1:1080",
+            "toggle on ⇒ rebuilt with the effective proxy"
+        );
+    }
+
+    /// Editing the react timeout rebuilds the session so the new value applies
+    /// on the next move, while re-applying the same timeout stays a no-op.
+    /// Regression for the configurable `react_timeout_ms` (issue #264).
+    #[tokio::test]
+    async fn changing_the_react_timeout_rebuilds_the_session() {
+        let notify = crate::event_bus::notify_bus();
+        let default_ms = NativeApiConfig::default().react_timeout_ms;
+        let mut bot = bot_with(cfg_api(UNREACHABLE_BASE_URL), notify).await;
+        // Seeded from the default.
+        assert_eq!(bot.api.as_ref().unwrap().react_timeout_ms, default_ms);
+
+        // Same config again ⇒ no rebuild (the timeout is part of the key, but
+        // it hasn't changed).
+        let same = api_on(UNREACHABLE_BASE_URL, &"k".repeat(32));
+        bot.apply_api_config(&same, Announce::Silently);
+        assert_eq!(bot.api.as_ref().unwrap().react_timeout_ms, default_ms);
+
+        // Bump the timeout ⇒ the session carries the new raw value.
+        let mut slower = same.clone();
+        slower.react_timeout_ms = 5_000;
+        bot.apply_api_config(&slower, Announce::Silently);
+        assert_eq!(bot.api.as_ref().unwrap().react_timeout_ms, 5_000);
+    }
+
     /// Switching the model id keeps the same server but re-requests under the new
     /// model; an unchanged config must not churn the client or toast.
     #[tokio::test]
@@ -1283,6 +1865,7 @@ mod tests {
             scores: vec![25000, 25000, 25000, 25000],
             tehais: vec![hand13(), hand13(), hand13(), hand13()],
             num_players: 4,
+            catch_up: 0,
         };
         let v = to_api_event(&sk, 2, 4);
         assert_eq!(v["type"], "start_kyoku");
@@ -1329,6 +1912,7 @@ mod tests {
             aka_flag: None,
             id: Some(0),
             num_players: 3,
+            game_meta: None,
         };
         let v = to_api_event(&sg, 0, 3);
         assert_eq!(v["names"].as_array().unwrap().len(), 4);
@@ -1346,6 +1930,7 @@ mod tests {
             scores: vec![35000, 35000, 35000],
             tehais: vec![hand13(), hand13(), hand13()],
             num_players: 3,
+            catch_up: 0,
         };
         let v = to_api_event(&sk, 0, 3);
         assert_eq!(v["scores"].as_array().unwrap().len(), 4);
@@ -1385,11 +1970,66 @@ mod tests {
             action: "dahai:W".into(),
             prob: 0.83,
         }];
-        let meta = build_show_meta_mjai(&ev, &cands).unwrap();
+        let meta = build_show_meta_mjai(&ev, &cands, "Akagi · 4p-x").unwrap();
+        assert_eq!(meta["show"]["title"], "Akagi · 4p-x");
         let item = &meta["show"]["items"][0];
         assert_eq!(item["label"], "Discard");
+        assert_eq!(item["type"], "dahai");
         assert_eq!(item["pais"][0], "W");
         assert_eq!(item["value"], "83%");
+    }
+
+    /// Each row says which mjai event it stands for, so pacing can tell a
+    /// runner-up *discard* from a button (`autoplay::delay::probs::runner_up`).
+    /// An API `kan` row names no single kan kind and carries no type.
+    #[test]
+    fn show_items_carry_their_mjai_type_where_the_label_names_one() {
+        let ev = MjaiEvent::Dahai {
+            actor: 0,
+            pai: "5p".into(),
+            tsumogiri: false,
+        };
+        let cands = vec![
+            Candidate {
+                action: "dahai:5p".into(),
+                prob: 0.5,
+            },
+            Candidate {
+                action: "dahai:1m".into(),
+                prob: 0.3,
+            },
+            Candidate {
+                action: "kan".into(),
+                prob: 0.1,
+            },
+            Candidate {
+                action: "none".into(),
+                prob: 0.1,
+            },
+        ];
+        let meta = build_show_meta_mjai(&ev, &cands, "Akagi · Online").unwrap();
+        let items = meta["show"]["items"].as_array().unwrap();
+        assert_eq!(items[0]["type"], "dahai");
+        assert_eq!(items[1]["type"], "dahai");
+        assert!(items[2].get("type").is_none(), "{:?}", items[2]);
+        assert_eq!(items[3]["type"], "none");
+        let read = crate::autoplay::delay::probs::candidates(Some(&meta));
+        assert_eq!(
+            crate::autoplay::delay::probs::runner_up(&read, "5p"),
+            Some("1m")
+        );
+    }
+
+    /// The card title names the API model that served the decision: the
+    /// server's report wins, then the configured id, then a generic "Online".
+    /// Blanks don't count as a model id.
+    #[test]
+    fn api_show_title_prefers_served_then_configured_then_online() {
+        assert_eq!(api_show_title(Some("4p-x"), Some("4p-cfg")), "Akagi · 4p-x");
+        assert_eq!(api_show_title(None, Some("4p-cfg")), "Akagi · 4p-cfg");
+        assert_eq!(api_show_title(Some(""), Some(" ")), "Akagi · Online");
+        assert_eq!(api_show_title(None, None), "Akagi · Online");
+        assert_eq!(api_show_title(Some(" 4p-x "), None), "Akagi · 4p-x");
     }
 
     #[test]
@@ -1412,6 +2052,10 @@ mod tests {
             ),
         ];
         let meta = build_show_meta(&cands).unwrap();
+        assert_eq!(
+            meta["show"]["title"], SHOW_TITLE_LOCAL,
+            "a local decision must be titled as such"
+        );
         let items = meta["show"]["items"].as_array().unwrap();
         assert_eq!(items.len(), 3, "should surface all three candidates");
         assert_eq!(items[0]["label"], "Discard");
@@ -1424,8 +2068,13 @@ mod tests {
         assert_eq!(items[2]["value"], "10%");
     }
 
+    /// Regression (#190): declining a call used to produce no card at all, so
+    /// the tile kept showing the previous turn's discard advice — live-looking
+    /// advice for a decision that was already over. The pass is the decision
+    /// here, and its probability against the call it turned down is the whole
+    /// point of the card.
     #[test]
-    fn local_show_meta_none_when_top_is_pass() {
+    fn local_show_meta_ranks_the_pass_against_the_call_it_declined() {
         let cands = vec![
             (BotAction::Pass, 0.9f32),
             (
@@ -1437,10 +2086,66 @@ mod tests {
                 0.1f32,
             ),
         ];
+
+        let meta = build_show_meta(&cands).expect("a declined call still has a card to show");
+        let items = meta["show"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "both the pass and the pon it beat");
+        assert_eq!(items[0]["label"], "Pass");
+        assert_eq!(items[0]["type"], "none");
+        assert_eq!(items[0]["value"], "90%");
         assert!(
-            build_show_meta(&cands).is_none(),
-            "a leading pass must not replace the card"
+            items[0].get("pais").is_none(),
+            "the pass row must draw no tile — it would read as a discard suggestion"
         );
+        assert_eq!(items[1]["label"], "Pon");
+        assert_eq!(items[1]["value"], "10%");
+    }
+
+    /// The other half of #190: a lone pass is *not* a decision. `WaitResponse`
+    /// opens for every seat as soon as any seat can claim, and the engine always
+    /// offers `Pass` there — so a seat with nothing to claim gets `[Pass]` back.
+    /// Showing "Pass 100%" for that would replace the card on every opponent
+    /// discard someone *else* could call.
+    #[test]
+    fn a_lone_pass_is_not_a_decision_point() {
+        assert!(
+            !is_decision_point(&[]),
+            "no legal action at all is not a decision"
+        );
+        assert!(
+            !is_decision_point(&[(BotAction::Pass, 1.0)]),
+            "someone else's call window is not our decision"
+        );
+    }
+
+    #[test]
+    fn a_choice_is_a_decision_point() {
+        let call_window = [
+            (BotAction::Pass, 0.9f32),
+            (
+                BotAction::Pon {
+                    target: 0,
+                    pai: "1m".into(),
+                    consumed: vec!["1m".into(), "1m".into()],
+                },
+                0.1f32,
+            ),
+        ];
+        assert!(
+            is_decision_point(&call_window),
+            "pass vs pon is exactly the decision the card exists to explain"
+        );
+
+        // Our own turn: no pass on offer, and even a single forced discard is a
+        // decision the player wants to see.
+        let forced_discard = [(
+            BotAction::Dahai {
+                pai: "1m".into(),
+                tsumogiri: true,
+            },
+            1.0f32,
+        )];
+        assert!(is_decision_point(&forced_discard));
     }
 
     #[test]
@@ -1464,7 +2169,8 @@ mod tests {
                 prob: 0.1,
             },
         ];
-        let meta = build_show_meta_mjai(&ev, &cands).unwrap();
+        let meta = build_show_meta_mjai(&ev, &cands, "Akagi · Online").unwrap();
+        assert_eq!(meta["show"]["title"], "Akagi · Online");
         let items = meta["show"]["items"].as_array().unwrap();
         assert_eq!(items.len(), 3);
         // Row 0 = exact chosen move; rows 1..= coarse candidate labels.
@@ -1478,12 +2184,12 @@ mod tests {
         assert_eq!(items[2]["value"], "10%");
     }
 
-    /// A call window where the model declines (pon 35% vs none 65%): the card
-    /// must show the chosen pass as row 0 AND keep `none` runner-up rows —
+    /// A call window where the model declines (pon 35% vs pass 65%): the card
+    /// must show the chosen pass as row 0 AND keep the pass runner-up rows —
     /// dropping them made the card read as recommending the declined call.
     #[test]
-    fn api_show_meta_renders_pass_and_none_rows() {
-        // Chosen move is pass: row 0 = "None" with candidates[0]'s prob.
+    fn api_show_meta_ranks_the_pass_alongside_the_call() {
+        // Chosen move is the pass: row 0 = "Pass" with candidates[0]'s prob.
         let cands = vec![
             Candidate {
                 action: "none".into(),
@@ -1494,15 +2200,17 @@ mod tests {
                 prob: 0.35,
             },
         ];
-        let meta = build_show_meta_mjai(&MjaiEvent::None, &cands).unwrap();
+        let meta = build_show_meta_mjai(&MjaiEvent::None, &cands, "Akagi · Online").unwrap();
         let items = meta["show"]["items"].as_array().unwrap();
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0]["label"], "None");
+        // Same word as the local path (#190): one card, one vocabulary,
+        // whichever inference path answered.
+        assert_eq!(items[0]["label"], "Pass");
         assert_eq!(items[0]["value"], "65%");
         assert_eq!(items[1]["label"], "Pon");
         assert_eq!(items[1]["value"], "35%");
 
-        // Chosen move is the call: the none runner-up still gets a row.
+        // Chosen move is the call: the pass runner-up still gets a row.
         let ev = MjaiEvent::Pon {
             actor: 0,
             target: 3,
@@ -1519,12 +2227,12 @@ mod tests {
                 prob: 0.45,
             },
         ];
-        let meta = build_show_meta_mjai(&ev, &cands).unwrap();
+        let meta = build_show_meta_mjai(&ev, &cands, "Akagi · Online").unwrap();
         let items = meta["show"]["items"].as_array().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["label"], "Pon");
         assert_eq!(items[0]["value"], "55%");
-        assert_eq!(items[1]["label"], "None");
+        assert_eq!(items[1]["label"], "Pass");
         assert_eq!(items[1]["value"], "45%");
     }
 

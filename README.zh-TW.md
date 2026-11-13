@@ -88,6 +88,7 @@ https://github.com/user-attachments/assets/2ce7cb71-8b25-4895-a12b-0a638665dcab
 - [Bots](#bots)
 - [對局歷史](#對局歷史)
 - [紀錄與診斷](#紀錄與診斷)
+- [下載鏡像](#下載鏡像)
 - [疑難排解](#疑難排解)
 - [Roadmap](#roadmap)
 
@@ -141,7 +142,7 @@ https://github.com/user-attachments/assets/2ce7cb71-8b25-4895-a12b-0a638665dcab
 | 平台 | 四麻 | 三麻 | AutoPlay |
 |---|:---:|:---:|:---:|
 | **雀魂（Mahjong Soul / Majsoul）** | &check; | &check; | &check; |
-| **天鳳（Tenhou）** | &check; | &check; | &cross; |
+| **天鳳（Tenhou）** | &check; | &check; | &check; |
 | **Riichi City** | &check; | &check; | &cross; |
 | **Amatsuki** | （規劃中） | （規劃中） | &cross; |
 
@@ -185,6 +186,20 @@ Akagi 以 portable zip 發佈 — 每個平台一個自帶所需檔案的資料�
    健康檢查：`GET /ping` → `pong`。
 3. Windows 上常用 [Proxifier](https://www.proxifier.com/)
    把指定應用程式導向 proxy。
+4. **把 loopback 排除在重導之外。** `localhost`、`127.0.0.1`、`::1`
+   一律走 Direct，不要經過 Akagi。
+
+> [!IMPORTANT]
+> 第 4 步不是可選的。遊戲會透過 loopback 跟自己通訊來處理內部事務，
+> 而「比對遊戲程式、目標為任意 host」的重導規則會把這些 socket
+> 一併掃進 Akagi。Akagi 會拒絕它們（紀錄裡會出現
+> `refusing CONNECT to loopback` 警告），但遊戲仍可能出問題 —
+> 所以請從源頭排除 loopback。
+>
+> Proxifier 的做法：**Profile → Proxification Rules**，啟用內建的
+> **Localhost** 規則（Action: *Direct*），並把它拖到遊戲規則的**上面**。
+> 順序很重要 — Proxifier 只採用第一條命中的規則，Localhost
+> 規則排在遊戲規則下面就永遠不會生效。
 
 ---
 
@@ -305,6 +320,36 @@ session；點選列可看到原始結構化欄位與來源位置。
 
 ---
 
+## 下載鏡像
+
+Akagi 執行期間會下載三類內容：應用程式更新與 bot 安裝來自
+**GitHub Releases**，Chrome for Testing 來自 **Google CDN**。
+在這些站點被封鎖或不穩定的地區（如中國大陸），可以在
+設定 → **下載** 中控制 GitHub 下載的路線：
+
+- **自動**（預設）— 先短逾時直連 GitHub，失敗後依序嘗試公共
+  gh-proxy 式加速鏡像。
+- **僅直連** — 從不使用鏡像。
+- **鏡像優先** — 已知 GitHub 連不上時跳過直連等待。
+- **自訂鏡像前綴** — 公共加速站時常失效；填一個你所在地區
+  可用的（如 `https://gh-proxy.com`），它會優先於內建清單使用。
+
+Chrome for Testing 不需設定：Google 端點連不上時會自動改用
+[npmmirror](https://registry.npmmirror.com) 鏡像下載。
+
+鏡像屬於第三方，因此完整性靠簽章而非傳輸通道保證：每個
+release zip 都以 [minisign](https://jedisct1.github.io/minisign/)
+簽章，經鏡像下載後應用程式會驗證簽章，驗證失敗（或舊的未簽章
+版本需要經過鏡像）時會拒絕安裝。手動驗證方式：
+
+```sh
+minisign -Vm akagi-<version>-<platform>.zip -p minisign.pub
+```
+
+其中 [`minisign.pub`](./minisign.pub) 位於儲存庫根目錄。
+
+---
+
 ## 疑難排解
 
 > [!TIP]
@@ -317,6 +362,9 @@ session；點選列可看到原始結構化欄位與來源位置。
   `curl http://127.0.0.1:23410/ping` 應回應 `pong`。
   確認你的 proxy 重導工具（Proxifier / 系統 proxy）
   正把遊戲客戶端送到正確的 host:port。
+- **MITM 模式下遊戲卡在加載畫面。** 多半是重導工具把遊戲的 loopback
+  流量也送進了 proxy。在紀錄裡找 `refusing CONNECT to loopback`，
+  然後排除 `localhost`、`127.0.0.1`、`::1` — 見上方 MITM 設定第 4 步。
 - **Chromium 模式抓不到封包。** Detect 沒找到瀏覽器。
   在設定或 `config.toml` 裡手動設定
   `capture.chromium.executable`。如果瀏覽器有啟動但沒
@@ -326,6 +374,9 @@ session；點選列可看到原始結構化欄位與來源位置。
   看到的最後一個訊框；附在 bug 報告裡。
 - **三麻挑了錯的 bot。** 檢查設定 → Bot 中的
   `bot.active_3p` — 它與 `bot.active_4p` 互相獨立。
+- **更新 / bot 安裝 / Chrome 下載逾時（中國大陸等）。**
+  參見[下載鏡像](#下載鏡像) — 把設定 → 下載調成「鏡像優先」，
+  或在「自訂鏡像前綴」填一個你確認可用的加速站。
 - **要去哪求助？** 聊天請至
   [Discord](https://discord.gg/Z2wjXUK8bN)，
   追蹤型的 bug 與功能建議請至
@@ -346,7 +397,7 @@ alpha.8 已完成：
 - [x] 從 GitHub release 或本機 ZIP 檔案安裝 bot
 - [x] Chromium 抓包模式（不需信任 CA）
 - [x] **自訂主題**（前端 theming hook）
-- [x] **AutoPlay**（先支援雀魂；由 bot 自主控制牌桌）
+- [x] **AutoPlay**（支援雀魂與天鳳；由 bot 自主控制牌桌）
 
 規劃中：
 
@@ -392,7 +443,8 @@ alpha.8 已完成：
 `bot-status`…）與 pull 指令和 backend 溝通，兩者的清單
 都在 [`src/ipc/README.md`](./src/ipc/README.md)。開啟
 AutoPlay 時，`autoplay` manager 會取用 bot 的決策，並透過
-Chromium 抓包 backend（CDP）點擊牌桌。
+Chromium 抓包 backend（CDP）執行：雀魂是在牌桌上點擊，天鳳的
+客戶端協定夠單純，則直接透過對局連線送出動作。
 
 ## 技術堆疊
 
@@ -420,7 +472,7 @@ Chromium 抓包 backend（CDP）點擊牌桌。
 .
 ├── src/
 │   ├── analysis/      向聽 / 待牌 / 和牌率 / 風險 / 切牌搜尋
-│   ├── autoplay/      bot 決策 → 透過 CDP 點擊牌桌（AutoPlay）
+│   ├── autoplay/      bot 決策 → 點擊牌桌（雀魂）或送出協定 frame（天鳳），皆走 CDP
 │   ├── bot/           Bot manager：內建 bot、雲端 API client、mjai 子行程執行器
 │   ├── bridge/        各平台協定 → MjaiEvent
 │   │   ├── majsoul/   雀魂（liqi protobuf）
@@ -578,11 +630,20 @@ portable zip:
 | OS runner | 目標 | 產出檔案 |
 |---|---|---|
 | `ubuntu-22.04`(glibc 2.35) | `x86_64-unknown-linux-gnu` | `akagi-<version>-linux-x64.zip` |
-| `macos-14` | `aarch64-apple-darwin` | `akagi-<version>-macos-arm64.zip` |
+| `macos-15` | `aarch64-apple-darwin` | `akagi-<version>-macos-arm64.zip` |
 | `windows-latest` | `x86_64-pc-windows-msvc` | `akagi-<version>-windows-x64.zip` |
 
 每個 zip 都將 `python-build-standalone` 3.12 + `uv` 一併放在
 binary 旁邊,bot 不需另外安裝系統 Python 即可運作。
+
+發佈 job 會以 [minisign](https://jedisct1.github.io/minisign/) 為
+release zip 簽章（產生 `<asset>.zip.minisig`，trusted comment 為
+檔名）。公鑰保存在儲存庫根目錄的
+[`minisign.pub`](./minisign.pub) 並內嵌於應用程式；凡是經過下載
+鏡像的更新都必須通過簽章驗證。簽章需要儲存庫 secret
+`MINISIGN_SECRET_KEY`（兩行的 minisign 私鑰檔，需以免密碼方式
+產生，如 `rsign generate -W`）；secret 缺失時 workflow 會警告並
+發佈未簽章產物。
 
 Tag 必須位於 `v3` 分支。
 

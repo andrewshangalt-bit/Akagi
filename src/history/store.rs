@@ -250,6 +250,7 @@ mod tests {
             our_rank: Some(1),
             our_delta: Some(5000),
             stats: GameStats::default(),
+            match_info: None,
             log_path: format!("games/{id}.mjai.jsonl"),
         }
     }
@@ -262,8 +263,9 @@ mod tests {
                 aka_flag: Some(true),
                 id: Some(0),
                 num_players: 4,
+                game_meta: None,
             },
-            MjaiEvent::EndGame,
+            MjaiEvent::end_game(),
         ]
     }
 

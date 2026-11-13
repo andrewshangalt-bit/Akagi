@@ -21,6 +21,7 @@ use crate::bot::PythonRuntime;
 use crate::config::AppConfig;
 use crate::event_bus::{
     AnalysisBus, BotResponseBus, BotStatusBus, CaptureStatusBus, HistoryBus, MjaiBus, NotifyBus,
+    PostTrackerBus,
 };
 use crate::game_state::GameTracker;
 use crate::history::recorder::SharedPlatform;
@@ -67,6 +68,9 @@ pub struct AppState {
     pub log_session: Arc<Session>,
 
     pub mjai_bus: MjaiBus,
+    /// Events re-emitted after the tracker applied them. The bot manager
+    /// runs off this rather than `mjai_bus` — see `event_bus::TrackedEvent`.
+    pub post_tracker_bus: PostTrackerBus,
     pub bot_response_bus: BotResponseBus,
     pub bot_status_bus: BotStatusBus,
     pub capture_status_bus: CaptureStatusBus,
@@ -121,6 +125,12 @@ pub struct AppState {
     /// `apply_update` both `try_lock()` it so the user mashing buttons
     /// can't race two HTTP fetches or — worse — two binary swaps.
     pub updater_lock: Arc<Mutex<()>>,
+    /// Result of the last successful `check_for_update`, and the ONLY
+    /// input `apply_update` acts on. The webview never round-trips an
+    /// `UpdateInfo` back to us — fields like `asset_url` and
+    /// `meta_source` are security policy inputs, and a compromised
+    /// frontend must not get to assert them.
+    pub pending_update: Arc<RwLock<Option<crate::updater::UpdateInfo>>>,
 }
 
 impl AppState {
@@ -130,6 +140,7 @@ impl AppState {
         config_path: PathBuf,
         log_session: Arc<Session>,
         mjai_bus: MjaiBus,
+        post_tracker_bus: PostTrackerBus,
         bot_response_bus: BotResponseBus,
         bot_status_bus: BotStatusBus,
         capture_status_bus: CaptureStatusBus,
@@ -147,6 +158,7 @@ impl AppState {
             config_path: Arc::new(config_path),
             log_session,
             mjai_bus,
+            post_tracker_bus,
             bot_response_bus,
             bot_status_bus,
             capture_status_bus,
@@ -165,6 +177,7 @@ impl AppState {
             autoplay_context: Arc::new(AutoplayContext::new()),
             autoplay_manager_started: Arc::new(AtomicBool::new(false)),
             updater_lock: Arc::new(Mutex::new(())),
+            pending_update: Arc::new(RwLock::new(None)),
         }
     }
 }

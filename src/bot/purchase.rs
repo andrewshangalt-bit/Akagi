@@ -1,11 +1,13 @@
-//! Self-serve purchase client for the inference API's PayPal endpoints
-//! (`/paypal/*`), as published by the inference server's own API documentation.
+//! Self-serve purchase client for the inference API's payment endpoints
+//! (`/paypal/*` and `/creem/*`), as published by the inference server's own
+//! API documentation.
 //!
 //! Every purchase is a three-step handshake: **create → approve → collect**.
-//! [`create_order`] / [`create_subscription`] start one and return an
-//! `approve_url` (opened in the buyer's browser) plus a one-time
-//! `claim_secret`. While the buyer approves on PayPal, the app polls
-//! [`order_result`] / [`subscription_result`] with `{id, claim}` until the
+//! [`create_order`] / [`create_subscription`] (PayPal) or [`create_checkout`]
+//! (Creem — one endpoint for both product kinds) start one and return a
+//! checkout URL (opened in the buyer's browser) plus a one-time
+//! `claim_secret`. While the buyer pays, the app polls [`order_result`] /
+//! [`subscription_result`] / [`checkout_result`] with `{id, claim}` until the
 //! status flips from `pending` to `ready` — which carries either an API key
 //! or a redeem code, depending on the purchase (see below).
 //!
@@ -36,7 +38,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use super::api::{check, normalize_base};
+use super::api::{check, http_client, normalize_base};
 
 /// `create-*` calls block on PayPal upstream (the server creates the order /
 /// subscription there before answering), so give them more headroom than the
@@ -60,6 +62,19 @@ pub struct CreatedOrder {
 pub struct CreatedSubscription {
     pub subscription_id: String,
     pub approve_url: String,
+    pub claim_secret: String,
+}
+
+/// `POST /creem/create-checkout` result — a pending Creem checkout. Creem
+/// (the merchant of record) uses ONE create endpoint for one-time *and*
+/// subscription products; the product id decides the kind.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedCheckout {
+    pub checkout_id: String,
+    /// Creem's hosted payment page for the buyer's browser.
+    pub checkout_url: String,
+    /// One-time secret gating the `/creem/result` poll — same contract as
+    /// the PayPal `claim_secret`: shown only here, never re-issued.
     pub claim_secret: String,
 }
 
@@ -120,8 +135,29 @@ struct CreateSubscriptionRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct CreateCheckoutRequest<'a> {
+    product: &'a str,
+    /// One-time products only — subscriptions always deliver the key. `false`
+    /// is the server default, so it is omitted from the wire entirely; that
+    /// keeps a subscription body down to `{product}`, where an unexpected
+    /// field would risk a `400 bad request` (as with PayPal subscriptions).
+    #[serde(skip_serializing_if = "is_false")]
+    redeem: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Serialize)]
 struct OrderResultRequest<'a> {
     order_id: &'a str,
+    claim: &'a str,
+}
+
+#[derive(Serialize)]
+struct CheckoutResultRequest<'a> {
+    checkout_id: &'a str,
     claim: &'a str,
 }
 
@@ -140,10 +176,15 @@ struct SubscriptionResultRequest<'a> {
 /// email — carries: `true` for the API key itself, `false` for a redeem code
 /// the caller must exchange. Pass `false` only when the code is needed as a
 /// code, i.e. to renew an existing key through `/v3/redeem`'s `renew_key`.
-pub async fn create_order(base_url: &str, product: &str, redeem: bool) -> Result<CreatedOrder> {
+pub async fn create_order(
+    base_url: &str,
+    proxy: &str,
+    product: &str,
+    redeem: bool,
+) -> Result<CreatedOrder> {
     let base = normalize_base(base_url);
     let url = format!("{base}/paypal/create-order");
-    let resp = build_http()?
+    let resp = http_client(PURCHASE_TIMEOUT, proxy)?
         .post(&url)
         .json(&CreateOrderRequest {
             product: product.trim(),
@@ -165,10 +206,15 @@ pub async fn create_order(base_url: &str, product: &str, redeem: bool) -> Result
 /// Idempotent and safe to repeat every few seconds until a terminal status.
 /// A wrong `claim` is a `404` and counts toward the per-IP failure guard, so
 /// never retry with guessed secrets.
-pub async fn order_result(base_url: &str, order_id: &str, claim: &str) -> Result<OrderResult> {
+pub async fn order_result(
+    base_url: &str,
+    proxy: &str,
+    order_id: &str,
+    claim: &str,
+) -> Result<OrderResult> {
     let base = normalize_base(base_url);
     let url = format!("{base}/paypal/order-result");
-    let resp = build_http()?
+    let resp = http_client(PURCHASE_TIMEOUT, proxy)?
         .post(&url)
         .json(&OrderResultRequest { order_id, claim })
         .send()
@@ -183,10 +229,14 @@ pub async fn order_result(base_url: &str, order_id: &str, claim: &str) -> Result
 /// `POST /paypal/create-subscription` (no auth) — start a recurring
 /// subscription for `product` (e.g. `pro-monthly`). Same non-idempotency
 /// caveat as [`create_order`].
-pub async fn create_subscription(base_url: &str, product: &str) -> Result<CreatedSubscription> {
+pub async fn create_subscription(
+    base_url: &str,
+    proxy: &str,
+    product: &str,
+) -> Result<CreatedSubscription> {
     let base = normalize_base(base_url);
     let url = format!("{base}/paypal/create-subscription");
-    let resp = build_http()?
+    let resp = http_client(PURCHASE_TIMEOUT, proxy)?
         .post(&url)
         .json(&CreateSubscriptionRequest {
             product: product.trim(),
@@ -204,12 +254,13 @@ pub async fn create_subscription(base_url: &str, product: &str) -> Result<Create
 /// `ready` the response carries the API key directly (no redeem step).
 pub async fn subscription_result(
     base_url: &str,
+    proxy: &str,
     subscription_id: &str,
     claim: &str,
 ) -> Result<SubscriptionResult> {
     let base = normalize_base(base_url);
     let url = format!("{base}/paypal/subscription-result");
-    let resp = build_http()?
+    let resp = http_client(PURCHASE_TIMEOUT, proxy)?
         .post(&url)
         .json(&SubscriptionResultRequest {
             subscription_id,
@@ -224,11 +275,63 @@ pub async fn subscription_result(
         .context("parse /paypal/subscription-result response")
 }
 
-fn build_http() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(PURCHASE_TIMEOUT)
-        .build()
-        .context("build purchase http client")
+/// `POST /creem/create-checkout` (no auth) — start a Creem purchase for
+/// `product` (one-time or subscription; one endpoint serves both). **Not
+/// idempotent**: each call opens a new checkout, so call once per purchase
+/// and reuse the returned ids.
+///
+/// `redeem` applies to one-time products only (subscriptions always deliver
+/// the key) and follows the PayPal semantics: `true` → the later
+/// [`checkout_result`] poll carries the API key itself; `false` → it carries
+/// a redeem code for `/v3/redeem` (needed to renew an existing key via
+/// `renew_key`).
+pub async fn create_checkout(
+    base_url: &str,
+    proxy: &str,
+    product: &str,
+    redeem: bool,
+) -> Result<CreatedCheckout> {
+    let base = normalize_base(base_url);
+    let url = format!("{base}/creem/create-checkout");
+    let resp = http_client(PURCHASE_TIMEOUT, proxy)?
+        .post(&url)
+        .json(&CreateCheckoutRequest {
+            product: product.trim(),
+            redeem,
+        })
+        .send()
+        .await
+        .context("POST /creem/create-checkout")?;
+    let resp = check(resp, "create checkout").await?;
+    resp.json::<CreatedCheckout>()
+        .await
+        .context("parse /creem/create-checkout response")
+}
+
+/// `POST /creem/result` (no auth) — poll a Creem checkout. The payload shape
+/// is identical to the PayPal [`order_result`] poll for **both** product
+/// kinds: on `ready` a one-time purchase carries the code or the key (per
+/// the `redeem` flag), and a subscription carries the key with `days: 0`.
+/// Same idempotency and wrong-claim (`404`, never retry with guesses)
+/// contract as PayPal.
+pub async fn checkout_result(
+    base_url: &str,
+    proxy: &str,
+    checkout_id: &str,
+    claim: &str,
+) -> Result<OrderResult> {
+    let base = normalize_base(base_url);
+    let url = format!("{base}/creem/result");
+    let resp = http_client(PURCHASE_TIMEOUT, proxy)?
+        .post(&url)
+        .json(&CheckoutResultRequest { checkout_id, claim })
+        .send()
+        .await
+        .context("POST /creem/result")?;
+    let resp = check(resp, "checkout result").await?;
+    resp.json::<OrderResult>()
+        .await
+        .context("parse /creem/result response")
 }
 
 #[cfg(test)]
@@ -343,6 +446,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn created_checkout_parses() {
+        let raw = r#"{"checkout_id":"ch_4jA9Yx1","checkout_url":"https://checkout.creem.io/pay/ch_4jA9Yx1",
+                      "claim_secret":"claimclaimclaimclaimclaimclaim34"}"#;
+        let c: CreatedCheckout = serde_json::from_str(raw).unwrap();
+        assert_eq!(c.checkout_id, "ch_4jA9Yx1");
+        assert!(c.checkout_url.starts_with("https://"));
+        assert_eq!(c.claim_secret.len(), 32);
+    }
+
+    /// A Creem subscription resolves through the SAME poll shape as a
+    /// one-time order — the key with `days: 0` marks the recurring kind.
+    #[test]
+    fn creem_subscription_result_is_key_with_zero_days() {
+        let raw =
+            r#"{"status":"ready","key":"k0000000000000000000000000000005","plan":"pro","days":0}"#;
+        let r: OrderResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(r.status, "ready");
+        assert_eq!(r.key.as_deref(), Some("k0000000000000000000000000000005"));
+        assert_eq!(r.days, Some(0));
+        assert!(r.code.is_none());
+    }
+
+    /// `redeem: false` must vanish from the create-checkout body (it is the
+    /// server default, and one endpoint serves subscriptions too — an
+    /// unexpected field there risks a `400`). `true` must be a real bool.
+    #[test]
+    fn create_checkout_body_omits_false_redeem() {
+        let v = serde_json::to_value(CreateCheckoutRequest {
+            product: "pro-monthly",
+            redeem: false,
+        })
+        .unwrap();
+        assert_eq!(v, serde_json::json!({"product": "pro-monthly"}));
+
+        let v = serde_json::to_value(CreateCheckoutRequest {
+            product: "pro-30",
+            redeem: true,
+        })
+        .unwrap();
+        assert_eq!(v, serde_json::json!({"product": "pro-30", "redeem": true}));
+        assert!(v["redeem"].is_boolean());
+
+        let v = serde_json::to_value(CheckoutResultRequest {
+            checkout_id: "ch_1",
+            claim: "SECRET",
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"checkout_id": "ch_1", "claim": "SECRET"})
+        );
+    }
+
     // ---- end-to-end against a local mock server (see `crate::bot::test_http`) ----
 
     /// `redeem: false` — the classic flow a renewal needs: `ready` hands back
@@ -361,18 +518,18 @@ mod tests {
             ),
         ]);
 
-        let created = create_order(&format!("{base}/"), "pro-30", false)
+        let created = create_order(&format!("{base}/"), "", "pro-30", false)
             .await
             .unwrap();
         assert_eq!(created.order_id, "OID1");
         assert_eq!(created.claim_secret, "S1");
 
-        let pending = order_result(&base, &created.order_id, &created.claim_secret)
+        let pending = order_result(&base, "", &created.order_id, &created.claim_secret)
             .await
             .unwrap();
         assert_eq!(pending.status, "pending");
 
-        let ready = order_result(&base, &created.order_id, &created.claim_secret)
+        let ready = order_result(&base, "", &created.order_id, &created.claim_secret)
             .await
             .unwrap();
         assert_eq!(ready.status, "ready");
@@ -404,10 +561,10 @@ mod tests {
             ),
         ]);
 
-        let created = create_order(&base, "pro-30", true).await.unwrap();
+        let created = create_order(&base, "", "pro-30", true).await.unwrap();
         assert_eq!(created.order_id, "OID2");
 
-        let ready = order_result(&base, &created.order_id, &created.claim_secret)
+        let ready = order_result(&base, "", &created.order_id, &created.claim_secret)
             .await
             .unwrap();
         assert_eq!(ready.status, "ready");
@@ -436,7 +593,7 @@ mod tests {
             r#"{"subscription_id":"I-2","approve_url":"https://paypal.example/sub","claim_secret":"S4"}"#.into(),
         )]);
 
-        create_subscription(&base, "pro-monthly").await.unwrap();
+        create_subscription(&base, "", "pro-monthly").await.unwrap();
 
         let reqs = served.join().unwrap();
         assert!(reqs[0].contains(r#"{"product":"pro-monthly"}"#));
@@ -456,10 +613,10 @@ mod tests {
             ),
         ]);
 
-        let created = create_subscription(&base, "pro-monthly").await.unwrap();
+        let created = create_subscription(&base, "", "pro-monthly").await.unwrap();
         assert_eq!(created.subscription_id, "I-1");
 
-        let ready = subscription_result(&base, &created.subscription_id, &created.claim_secret)
+        let ready = subscription_result(&base, "", &created.subscription_id, &created.claim_secret)
             .await
             .unwrap();
         assert_eq!(ready.status, "ready");
@@ -474,6 +631,83 @@ mod tests {
         assert!(reqs[1].contains(r#""subscription_id":"I-1""#));
     }
 
+    /// Creem one-time with `redeem: true` — create hits `/creem/create-checkout`
+    /// with a real JSON bool, and the `/creem/result` poll surfaces the key.
+    #[tokio::test]
+    async fn creem_checkout_roundtrip_returns_key_directly() {
+        let (base, served) = mock_http(vec![
+            (
+                "200 OK",
+                r#"{"checkout_id":"ch_A1","checkout_url":"https://checkout.creem.example/pay/ch_A1","claim_secret":"S5"}"#.into(),
+            ),
+            ("200 OK", r#"{"status":"pending"}"#.into()),
+            (
+                "200 OK",
+                r#"{"status":"ready","key":"k0000000000000000000000000000006","plan":"pro","days":30}"#.into(),
+            ),
+        ]);
+
+        let created = create_checkout(&base, "", "pro-30", true).await.unwrap();
+        assert_eq!(created.checkout_id, "ch_A1");
+        assert_eq!(created.claim_secret, "S5");
+
+        let pending = checkout_result(&base, "", &created.checkout_id, &created.claim_secret)
+            .await
+            .unwrap();
+        assert_eq!(pending.status, "pending");
+
+        let ready = checkout_result(&base, "", &created.checkout_id, &created.claim_secret)
+            .await
+            .unwrap();
+        assert_eq!(ready.status, "ready");
+        assert_eq!(
+            ready.key.as_deref(),
+            Some("k0000000000000000000000000000006")
+        );
+        assert!(ready.code.is_none());
+
+        let reqs = served.join().unwrap();
+        assert!(reqs[0].starts_with("POST /creem/create-checkout HTTP/1.1"));
+        assert!(reqs[0].contains(r#"{"product":"pro-30","redeem":true}"#));
+        assert!(reqs[1].starts_with("POST /creem/result HTTP/1.1"));
+        assert!(reqs[1].contains(r#""checkout_id":"ch_A1""#));
+        assert!(reqs[1].contains(r#""claim":"S5""#));
+    }
+
+    /// A Creem subscription create must NOT carry `redeem` (the endpoint is
+    /// shared with one-time products; subscriptions always mint a key), and
+    /// its poll resolves to a key with `days: 0`.
+    #[tokio::test]
+    async fn creem_subscription_omits_redeem_and_polls_to_key() {
+        let (base, served) = mock_http(vec![
+            (
+                "200 OK",
+                r#"{"checkout_id":"ch_B2","checkout_url":"https://checkout.creem.example/pay/ch_B2","claim_secret":"S6"}"#.into(),
+            ),
+            (
+                "200 OK",
+                r#"{"status":"ready","key":"k0000000000000000000000000000007","plan":"pro","days":0}"#.into(),
+            ),
+        ]);
+
+        let created = create_checkout(&base, "", "pro-monthly", false)
+            .await
+            .unwrap();
+        let ready = checkout_result(&base, "", &created.checkout_id, &created.claim_secret)
+            .await
+            .unwrap();
+        assert_eq!(ready.status, "ready");
+        assert_eq!(
+            ready.key.as_deref(),
+            Some("k0000000000000000000000000000007")
+        );
+        assert_eq!(ready.days, Some(0));
+
+        let reqs = served.join().unwrap();
+        assert!(reqs[0].contains(r#"{"product":"pro-monthly"}"#));
+        assert!(!reqs[0].contains("redeem"), "got: {}", reqs[0]);
+    }
+
     /// Server error bodies surface through `check` with the endpoint label
     /// and the server's generic message — what the frontend shows verbatim.
     #[tokio::test]
@@ -482,7 +716,7 @@ mod tests {
             "400 Bad Request",
             r#"{"error":"unknown product"}"#.into(),
         )]);
-        let err = create_order(&base, "nope-99", true).await.unwrap_err();
+        let err = create_order(&base, "", "nope-99", true).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("create order failed"), "got: {msg}");
         assert!(msg.contains("HTTP 400"), "got: {msg}");
@@ -495,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn order_result_wrong_claim_is_404() {
         let (base, served) = mock_http(vec![("404 Not Found", r#"{"error":"not found"}"#.into())]);
-        let err = order_result(&base, "OID1", "WRONG").await.unwrap_err();
+        let err = order_result(&base, "", "OID1", "WRONG").await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("HTTP 404"), "got: {msg}");
         served.join().unwrap();

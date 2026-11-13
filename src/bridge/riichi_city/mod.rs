@@ -6,12 +6,12 @@
 //! …); the binary `cmd` field only matters for `CMDAuth`, which carries our
 //! `uid`. See [`packet`] for the framing and [`consts`] for the tile table.
 //!
-//! Faithful Rust port of the observation half of the original Akagi v2 Python
-//! Riichi City bridge (`mitm/bridge/riichi_city/bridge.py`). Riichi City has no
-//! web client and no autoplay, so this is observe-only: [`build`](Bridge::build)
-//! is a no-op and both wire directions are parsed (the `CMDAuth` `uid` packet is
-//! client→server while gameplay broadcasts are server→client; client request
-//! frames simply don't match any server `cmd_*` and fall through).
+//! Rust port of the observation half of the Akagi v2 Python Riichi City
+//! bridge, extended with the uplink half autoplay needs: [`build`](Bridge::build)
+//! encodes our actions as client frames injected onto the gameplay socket.
+//! Both wire directions are parsed (the `CMDAuth` packet is client→server
+//! while gameplay broadcasts are server→client; client request frames don't
+//! match any server `cmd_*` and fall through).
 //!
 //! Two intentional improvements over v2:
 //! - **Sanma** events use the native length 3 (no ghost-padding to 4); actor
@@ -28,6 +28,7 @@
 //! diff would double-count it. The action codes 7/10/12 in
 //! `cmd_game_action_brc` only flag the end — the scores live in `cmd_game_end`.
 
+pub mod build;
 pub mod consts;
 pub mod packet;
 pub mod state;
@@ -36,7 +37,7 @@ use super::{Bridge, Direction, ParseResult};
 use crate::{
     config::Platform,
     logger::{FlowLogger, Session},
-    schema::{MjaiEvent, ParsedFrame},
+    schema::{GameMeta, MatchInfo, MjaiEvent, ParsedFrame},
 };
 use chrono::Local;
 use consts::card_to_mjai;
@@ -57,6 +58,10 @@ pub struct RiichiCityBridge {
     flow_log: Option<Arc<FlowLogger>>,
     session: Option<Arc<Session>>,
     mjai_log: Option<Arc<FlowLogger>>,
+    /// Frame-injection gate (see `autoplay::inject`): set while this
+    /// connection is inside a game, so injected gameplay frames only ride
+    /// the WS flow that is actually carrying one.
+    inject: Option<crate::autoplay::inject::SharedInjectBus>,
 }
 
 impl RiichiCityBridge {
@@ -67,7 +72,13 @@ impl RiichiCityBridge {
             flow_log,
             session,
             mjai_log: None,
+            inject: None,
         }
+    }
+
+    pub fn with_inject(mut self, inject: Option<crate::autoplay::inject::SharedInjectBus>) -> Self {
+        self.inject = inject;
+        self
     }
 
     /// Open a fresh `riichi_city_<ts>.mjai.jsonl` per game (Tenhou/Majsoul
@@ -102,7 +113,7 @@ impl RiichiCityBridge {
     }
 
     fn dispatch(&mut self, pkt: &WPacket) -> Vec<MjaiEvent> {
-        // The binary auth handshake carries our uid (client → server).
+        // The binary auth handshake (client → server) carries our uid.
         if pkt.cmd == CMD_AUTH {
             if let Some(uid) = pkt.body.get("uid").and_then(json_i64) {
                 self.uid = uid;
@@ -114,8 +125,38 @@ impl RiichiCityBridge {
             return Vec::new();
         };
         let data = pkt.body.get("data");
+        // Decision-window state: opened by the server's cmd_send_* offers,
+        // closed by anything that resolves play.
+        if let Some(inject) = &self.inject {
+            match cmd {
+                "cmd_send_current_action" | "cmd_send_other_action" => inject.note_window(),
+                "cmd_game_action_brc" | "cmd_game_end" | "cmd_room_end" | "cmd_game_start" => {
+                    inject.note_window_closed()
+                }
+                _ => {}
+            }
+        }
         match cmd {
-            "cmd_enter_room" => self.on_enter_room(data),
+            // Per-request ack, counted for autoplay verification.
+            "rsp_game_action" => {
+                if let Some(inject) = &self.inject {
+                    let code = data
+                        .and_then(|d| d.get("code"))
+                        .and_then(json_i64)
+                        .unwrap_or(0);
+                    inject.note_rsp(code);
+                }
+                Vec::new()
+            }
+            "cmd_enter_room" => {
+                // Wire sends the table token as a string; tolerate a number.
+                let room_id = pkt.body.get("room_id").and_then(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .or_else(|| json_i64(v).map(|n| n.to_string()))
+                });
+                self.on_enter_room(room_id, data)
+            }
             "cmd_game_start" => self.on_game_start(data),
             "cmd_in_card_brc" => self.on_in_card_brc(data),
             "cmd_send_current_action" => self.on_send_current_action(data),
@@ -128,13 +169,25 @@ impl RiichiCityBridge {
     }
 
     /// `cmd_enter_room` — collect players + table size; emits nothing. Dedups
-    /// repeated messages for the same room by `classify_id` (a latent no-op in
-    /// v2, where `classify_id` was never stored).
-    fn on_enter_room(&mut self, data: Option<&JsonValue>) -> Vec<MjaiEvent> {
+    /// a repeated announcement of the *same table* by the wrapper's
+    /// `room_id` (the per-table instance token) — NOT by `classify_id`,
+    /// which names the matchmaking queue class and so repeats across
+    /// consecutive games in the same room tier. The dedup also requires an
+    /// already-collected roster, so a fuller re-announcement can still
+    /// replace an empty one.
+    fn on_enter_room(
+        &mut self,
+        room_id: Option<String>,
+        data: Option<&JsonValue>,
+    ) -> Vec<MjaiEvent> {
         let Some(data) = data else { return Vec::new() };
-        let classify_id = data.pointer("/options/classify_id").and_then(json_i64);
-        if let (Some(prev), Some(now)) = (self.status.classify_id, classify_id) {
-            if prev == now {
+        let classify_id = data.pointer("/options/classify_id").and_then(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| json_i64(v).map(|n| n.to_string()))
+        });
+        if let (Some(prev), Some(now)) = (self.status.room_id.as_deref(), room_id.as_deref()) {
+            if prev == now && !self.status.player_list.is_empty() {
                 warn!(target: LOG, "duplicate cmd_enter_room for active room, ignored");
                 return Vec::new();
             }
@@ -149,16 +202,25 @@ impl RiichiCityBridge {
             is_3p,
             num_players: if is_3p { 3 } else { 4 },
             classify_id,
+            room_id,
+            stage_type: data.pointer("/options/stage_type").and_then(json_i64),
+            game_play: data.pointer("/options/game_play").and_then(json_i64),
             ..GameStatus::default()
         };
         if let Some(players) = data.get("players").and_then(JsonValue::as_array) {
             for p in players {
                 if let Some(uid) = p.pointer("/user/user_id").and_then(json_i64) {
                     status.player_list.push(uid);
+                    if let Some(name) = p.pointer("/user/nickname").and_then(JsonValue::as_str) {
+                        status.nicknames.insert(uid, name.to_string());
+                    }
                 }
             }
         }
         self.status = status;
+        if let Some(inject) = &self.inject {
+            inject.set_in_game(true);
+        }
         Vec::new()
     }
 
@@ -190,15 +252,32 @@ impl RiichiCityBridge {
             self.status.seat = seat;
             self.status.shift = dealer_pos;
             self.rotate_mjai_log();
-            let names: Vec<String> = (0..self.status.num_players)
-                .map(|i| i.to_string())
+            // Display names in mjai-actor order (player_list is already
+            // dealer-rotated). A missing nickname becomes "" so the frontend
+            // falls back to its localized "Seat N" label.
+            let mut names: Vec<String> = self
+                .status
+                .player_list
+                .iter()
+                .map(|uid| self.status.nicknames.get(uid).cloned().unwrap_or_default())
                 .collect();
+            names.resize(self.status.num_players as usize, String::new());
             events.push(MjaiEvent::StartGame {
                 names,
                 kyoku_first: None,
                 aka_flag: None,
                 id: Some(seat),
                 num_players: self.status.num_players,
+                game_meta: Some(GameMeta {
+                    game_id: None,
+                    match_mode: None,
+                    match_info: Some(MatchInfo::RiichiCity {
+                        room_id: self.status.room_id.clone(),
+                        classify_id: self.status.classify_id.clone(),
+                        stage_type: self.status.stage_type,
+                        game_play: self.status.game_play,
+                    }),
+                }),
             });
             self.status.game_start = false;
         }
@@ -209,17 +288,21 @@ impl RiichiCityBridge {
         let honba = field_i64(data, "ben_chang_num").unwrap_or(0).max(0) as u8;
         let kyotaku = field_i64(data, "li_zhi_bang_num").unwrap_or(0).max(0) as u8;
 
-        // Scores from user_info_list, which is in fixed seat order (index i =
-        // seat i). Verified against a full 13-kyoku capture with rotating
-        // dealers: the list never re-orders with dealer_pos.
+        // user_info_list stays in fixed wire-seat order, while player_list is
+        // rotated into MJAI actor order. Map by user_id so each score follows
+        // the same actor assignment as gameplay events and settlement deltas.
         let mut scores = vec![0i32; self.status.num_players as usize];
         if let Some(list) = data.get("user_info_list").and_then(JsonValue::as_array) {
-            for (i, p) in list
-                .iter()
-                .take(self.status.num_players as usize)
-                .enumerate()
-            {
-                scores[i] = field_i64(p, "hand_points").unwrap_or(0) as i32;
+            for p in list.iter().take(self.status.num_players as usize) {
+                let Some(uid) = field_i64(p, "user_id") else {
+                    continue;
+                };
+                let Some(actor) = self.status.actor_of(uid) else {
+                    continue;
+                };
+                if let Some(score) = scores.get_mut(actor as usize) {
+                    *score = field_i64(p, "hand_points").unwrap_or(0) as i32;
+                }
             }
         }
 
@@ -254,22 +337,31 @@ impl RiichiCityBridge {
             scores,
             tehais,
             num_players: self.status.num_players,
+            catch_up: 0,
         });
 
         self.status.pending_dora.clear();
         self.status.pending_reach = None;
+        self.status.meld_counts = [0; 4];
+        self.status.pons = Default::default();
 
         // Opening draw: our own drawn 14th tile if we are the dealer, otherwise
         // the dealer's hidden first draw.
         match tsumo_code {
-            Some(code) => events.push(MjaiEvent::Tsumo {
-                actor: self.status.seat,
-                pai: card_to_mjai(code as u32),
-            }),
-            None => events.push(MjaiEvent::Tsumo {
-                actor: oya,
-                pai: "?".to_string(),
-            }),
+            Some(code) => {
+                self.status.drawn_by = Some(self.status.seat);
+                events.push(MjaiEvent::Tsumo {
+                    actor: self.status.seat,
+                    pai: card_to_mjai(code as u32),
+                });
+            }
+            None => {
+                self.status.drawn_by = Some(oya);
+                events.push(MjaiEvent::Tsumo {
+                    actor: oya,
+                    pai: "?".to_string(),
+                });
+            }
         }
         events
     }
@@ -285,6 +377,7 @@ impl RiichiCityBridge {
             warn!(target: LOG, "cmd_in_card_brc from unknown user_id");
             return events;
         };
+        self.status.drawn_by = Some(actor);
         events.push(MjaiEvent::Tsumo {
             actor,
             pai: field_card(data, "card"),
@@ -292,12 +385,17 @@ impl RiichiCityBridge {
         events
     }
 
-    /// `cmd_send_current_action` — our own draw (revealed tile).
+    /// `cmd_send_current_action` — our own draw (revealed tile). Also
+    /// fires with `in_card: 0` as the discard prompt after our own
+    /// chi/pon (the client's handler documents both), which is no draw
+    /// at all — the `"?"` guard skips it, and `drawn_by` must stay unset
+    /// so the following discard is never read as tsumogiri.
     fn on_send_current_action(&mut self, data: Option<&JsonValue>) -> Vec<MjaiEvent> {
         let mut events = self.flush_pending_reach();
         let Some(data) = data else { return events };
         let pai = field_card(data, "in_card");
         if pai != "?" {
+            self.status.drawn_by = Some(self.status.seat);
             events.push(MjaiEvent::Tsumo {
                 actor: self.status.seat,
                 pai,
@@ -331,6 +429,13 @@ impl RiichiCityBridge {
                 warn!(target: LOG, "game action from unknown user_id");
                 continue;
             };
+            // Chi/pon/daiminkan/ankan shrink the caller's rack by one
+            // 3-tile set (a kakan upgrades a counted pon; kita nets zero).
+            if matches!(act, 2..=6 | 8) {
+                if let Some(m) = self.status.meld_counts.get_mut(actor as usize) {
+                    *m = m.saturating_add(1);
+                }
+            }
             match act {
                 2..=4 => {
                     // Chi always calls from kamicha (previous seat).
@@ -344,12 +449,19 @@ impl RiichiCityBridge {
                     });
                 }
                 5 => {
-                    let consumed = group_cards(action);
+                    let group = group_cards(action);
+                    let pai = field_card(action, "card");
+                    let consumed = [idx(&group, 0), idx(&group, 1)];
+                    // Remembered for a later kakan, whose broadcast names
+                    // only the added tile.
+                    if let Some(pons) = self.status.pons.get_mut(actor as usize) {
+                        pons.push([pai.clone(), consumed[0].clone(), consumed[1].clone()]);
+                    }
                     events.push(MjaiEvent::Pon {
                         actor,
                         target: self.status.last_dahai_actor.unwrap_or(actor),
-                        pai: field_card(action, "card"),
-                        consumed: [idx(&consumed, 0), idx(&consumed, 1)],
+                        pai,
+                        consumed,
                     });
                 }
                 6 => {
@@ -362,25 +474,25 @@ impl RiichiCityBridge {
                     });
                 }
                 8 => {
-                    // Concealed kan: four copies, the first marked red for 5s.
-                    let base = field_card(action, "card");
-                    let red = red_of(&base);
+                    // Concealed kan: the broadcast echoes the caller's
+                    // request, so `card` plus the three `group_cards` are the
+                    // four copies as they left the rack — a red five may be
+                    // any of them, `card` included.
+                    let pai = field_card(action, "card");
                     events.push(MjaiEvent::Ankan {
                         actor,
-                        consumed: [red, base.clone(), base.clone(), base],
+                        consumed: ankan_consumed(&pai, &group_cards(action)),
                     });
                 }
                 9 => {
-                    // Added kan: pai is the added tile; the existing pon is three
-                    // copies. If the added tile is a plain 5 the pon held the red;
-                    // if it is the red 5 the pon held three plain.
+                    // Added kan: `card` is the added tile and `group_cards`
+                    // is empty, so the pon's three tiles come from the pon
+                    // this seat called earlier.
                     let pai = field_card(action, "card");
-                    let consumed = if is_red(&pai) {
-                        let plain = pai[..2].to_string();
-                        [plain.clone(), plain.clone(), plain]
-                    } else {
-                        [red_of(&pai), pai.clone(), pai.clone()]
-                    };
+                    let consumed = self.take_pon(actor, &pai).unwrap_or_else(|| {
+                        warn!(target: LOG, "kakan without a tracked pon; inferring consumed");
+                        kakan_consumed_fallback(&pai)
+                    });
                     events.push(MjaiEvent::Kakan {
                         actor,
                         pai,
@@ -389,11 +501,27 @@ impl RiichiCityBridge {
                 }
                 11 => {
                     let pai = field_card(action, "card");
-                    let tsumogiri = match action.get("move_cards_pos").and_then(JsonValue::as_array)
-                    {
-                        Some(a) if !a.is_empty() => a.first().and_then(json_i64) == Some(14),
-                        _ => true,
-                    };
+                    // Tsumogiri inference: `move_cards_pos[0]` is the tile's
+                    // 1-based rack slot and the held draw racks LAST, so a
+                    // tsumogiri names exactly `13 - 3*melds + 1` — the rack
+                    // size while holding a draw. The client clamps a
+                    // would-be last-slot tedashi below that
+                    // (`CheckOutCardIndex`), making the sentinel
+                    // unambiguous — but only on a turn that actually drew:
+                    // a post-chi/pon discard reuses the same slot range
+                    // with no draw involved.
+                    let drawn_slot = self
+                        .status
+                        .meld_counts
+                        .get(actor as usize)
+                        .map(|&m| 13 - 3 * m as i64 + 1);
+                    let tsumogiri = self.status.drawn_by == Some(actor)
+                        && match action.get("move_cards_pos").and_then(JsonValue::as_array) {
+                            Some(a) if !a.is_empty() => a.first().and_then(json_i64) == drawn_slot,
+                            // No positions: the draw is all we know.
+                            _ => true,
+                        };
+                    self.status.drawn_by = None;
                     let is_li_zhi = field_bool(action, "is_li_zhi");
                     if is_li_zhi {
                         events.push(MjaiEvent::Reach { actor, pai: None });
@@ -449,6 +577,28 @@ impl RiichiCityBridge {
     /// deltas + ura-dora) or a `ryukyoku`, then `end_kyoku`.
     fn on_game_end(&mut self, data: Option<&JsonValue>) -> Vec<MjaiEvent> {
         let mut events = self.flush_pending_reach();
+        // Report the settlement's size for the round-advance pacing: the
+        // client's score screen renders progressively per yaku, and a
+        // mangan-plus takes visibly longer than five seconds to finish.
+        if let Some(inject) = &self.inject {
+            let hand = data
+                .and_then(|d| d.get("win_info"))
+                .and_then(JsonValue::as_array)
+                .and_then(|ws| {
+                    ws.iter()
+                        .find(|w| field_i64(w, "all_point").unwrap_or(0) > 0)
+                })
+                .map(|w| {
+                    let han = field_i64(w, "all_fang_num").unwrap_or(0).max(0) as u32;
+                    let yakus = w
+                        .get("fang_info")
+                        .and_then(JsonValue::as_array)
+                        .map_or(0, |a| a.len() as u32);
+                    (han, yakus)
+                })
+                .unwrap_or((0, 0));
+            inject.note_settlement(hand.0, hand.1);
+        }
         let Some(data) = data else {
             events.push(MjaiEvent::EndKyoku);
             return events;
@@ -543,7 +693,10 @@ impl RiichiCityBridge {
     /// `cmd_room_end` — game over.
     fn on_room_end(&mut self) -> Vec<MjaiEvent> {
         self.status = GameStatus::default();
-        vec![MjaiEvent::EndGame]
+        if let Some(inject) = &self.inject {
+            inject.set_in_game(false);
+        }
+        vec![MjaiEvent::end_game()]
     }
 
     fn flush_pending_reach(&mut self) -> Vec<MjaiEvent> {
@@ -552,15 +705,32 @@ impl RiichiCityBridge {
             None => Vec::new(),
         }
     }
+
+    /// Remove and return `actor`'s pon of `pai`'s kind (red and plain fives
+    /// match), the meld a kakan upgrades.
+    fn take_pon(&mut self, actor: u8, pai: &str) -> Option<[String; 3]> {
+        let pons = self.status.pons.get_mut(actor as usize)?;
+        let i = pons.iter().position(|p| plain_of(&p[0]) == plain_of(pai))?;
+        Some(pons.remove(i))
+    }
 }
 
 impl Bridge for RiichiCityBridge {
-    fn parse(&mut self, _direction: Direction, content: &[u8]) -> ParseResult {
+    fn parse(&mut self, direction: Direction, content: &[u8]) -> ParseResult {
         // Both directions are parsed: the CMDAuth uid is client→server, gameplay
         // is server→client. A frame normally holds one packet.
         let packets = WPacket::parse_frame(content);
         if packets.is_empty() {
             return ParseResult::empty();
+        }
+        // Track the client's uplink request counter (injected frames are
+        // indexed past it).
+        if matches!(direction, Direction::Up) {
+            if let Some(bus) = &self.inject {
+                for pkt in &packets {
+                    bus.note_up_index(pkt.message_index);
+                }
+            }
         }
         let parsed = Some(ParsedFrame {
             method: packets[0].method_label(),
@@ -574,9 +744,8 @@ impl Bridge for RiichiCityBridge {
         ParseResult { events, parsed }
     }
 
-    fn build(&mut self, _command: &MjaiEvent) -> Option<Vec<u8>> {
-        // Observe-only — Riichi City has no autoplay.
-        None
+    fn build(&mut self, command: &MjaiEvent) -> Option<Vec<u8>> {
+        build::encode_action(command)
     }
 }
 
@@ -636,12 +805,57 @@ fn is_red(pai: &str) -> bool {
     matches!(pai, "5mr" | "5pr" | "5sr")
 }
 
+/// `pai` without its red marker: `5mr` → `5m`; anything else unchanged.
+fn plain_of(pai: &str) -> &str {
+    if is_red(pai) {
+        &pai[..2]
+    } else {
+        pai
+    }
+}
+
 /// The red-five variant of a plain `5m`/`5p`/`5s`; otherwise the tile itself.
 fn red_of(pai: &str) -> String {
     match pai {
         "5m" | "5p" | "5s" => format!("{pai}r"),
         other => other.to_string(),
     }
+}
+
+/// Ankan `consumed`: `card` plus its three `group_cards`, as sent. Only when
+/// the group isn't three copies of `card`'s kind, or names more than one red
+/// (there is one per suit), is it inferred — four of the kind with one red
+/// for fives.
+fn ankan_consumed(pai: &str, group: &[String]) -> [String; 4] {
+    if let [a, b, c] = group {
+        let tiles = [pai, a, b, c];
+        if pai != "?"
+            && tiles.iter().all(|t| plain_of(t) == plain_of(pai))
+            && tiles.iter().filter(|t| is_red(t)).count() <= 1
+        {
+            return tiles.map(str::to_string);
+        }
+    }
+    warn!(target: LOG, "ankan without three matching group_cards; inferring consumed");
+    let plain = plain_of(pai);
+    [
+        red_of(plain),
+        plain.to_string(),
+        plain.to_string(),
+        plain.to_string(),
+    ]
+}
+
+/// Kakan `consumed` when the upgraded pon wasn't seen: three of the kind,
+/// one red for fives unless the added tile is the red (one red per suit).
+fn kakan_consumed_fallback(pai: &str) -> [String; 3] {
+    let plain = plain_of(pai);
+    let first = if is_red(pai) {
+        plain.to_string()
+    } else {
+        red_of(plain)
+    };
+    [first, plain.to_string(), plain.to_string()]
 }
 
 #[cfg(test)]
@@ -670,22 +884,141 @@ mod tests {
         feed(b, CMD_AUTH, json!({ "uid": ME.to_string() }));
     }
 
+    /// Every rsp_game_action must bump the ack counter autoplay verifies
+    /// its injected frames against.
+    #[test]
+    fn rsp_game_action_bumps_the_ack_counter() {
+        let inject = std::sync::Arc::new(crate::autoplay::inject::InjectBus::new());
+        let mut bridge = RiichiCityBridge::new(None, None).with_inject(Some(inject.clone()));
+        let ticket = inject.rsp_ticket();
+        feed(
+            &mut bridge,
+            6,
+            json!({ "cmd": "rsp_game_action", "data": { "code": 0 } }),
+        );
+        assert!(inject.rsp_since(ticket));
+        assert_eq!(inject.last_rsp_code(), 0);
+
+        feed(
+            &mut bridge,
+            6,
+            json!({ "cmd": "rsp_game_action", "data": { "code": 4001 } }),
+        );
+        assert_eq!(inject.last_rsp_code(), 4001);
+    }
+
     fn enter_room_4p(b: &mut RiichiCityBridge) {
+        // Mirrors the real wire shape: string ids, room token on the wrapper.
         feed(
             b,
             18,
             json!({
                 "cmd": "cmd_enter_room",
+                "room_id": "tabletoken0001",
                 "data": {
-                    "options": { "classify_id": 555, "player_count": 4 },
+                    "options": {
+                        "classify_id": "classifytoken0001",
+                        "player_count": 4,
+                        "stage_type": 1,
+                        "game_play": 1001
+                    },
                     "players": [
-                        {"user": {"user_id": 1001}},
-                        {"user": {"user_id": 1002}},
-                        {"user": {"user_id": 1003}},
-                        {"user": {"user_id": 1004}}
+                        {"user": {"user_id": 1001, "nickname": "alice"}},
+                        {"user": {"user_id": 1002, "nickname": "bob"}},
+                        {"user": {"user_id": 1003, "nickname": "carol"}},
+                        {"user": {"user_id": 1004, "nickname": "dave"}}
                     ]
                 }
             }),
+        );
+    }
+
+    /// Consecutive games in the same matchmaking queue share a
+    /// `classify_id` but get distinct table tokens. The dedup must key on
+    /// the table token: the second game's `cmd_enter_room` must be honored
+    /// (fresh `start_game`) even without an intervening `cmd_room_end`.
+    #[test]
+    fn same_queue_new_table_is_not_deduped() {
+        let mut b = RiichiCityBridge::new(None, None);
+        auth(&mut b);
+        enter_room_4p(&mut b);
+        let start = json!({
+            "cmd": "cmd_game_start",
+            "data": {
+                "quan_feng": 0x31, "bao_pai_card": 0x21, "dealer_pos": 0,
+                "ben_chang_num": 0, "li_zhi_bang_num": 0,
+                "user_info_list": [
+                    {"user_id": 1001, "hand_points": 25000},
+                    {"user_id": 1002, "hand_points": 25000},
+                    {"user_id": 1003, "hand_points": 25000},
+                    {"user_id": 1004, "hand_points": 25000}
+                ],
+                "hand_cards": [0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x01,0x02,0x03,0x04,0x05]
+            }
+        });
+        let events = feed(&mut b, 18, start.clone());
+        assert!(matches!(events[0], MjaiEvent::StartGame { .. }));
+
+        // Next game, same queue class, new table token.
+        feed(
+            &mut b,
+            18,
+            json!({
+                "cmd": "cmd_enter_room",
+                "room_id": "tabletoken0002",
+                "data": {
+                    "options": {
+                        "classify_id": "classifytoken0001",
+                        "player_count": 4,
+                        "stage_type": 1,
+                        "game_play": 1001
+                    },
+                    "players": [
+                        {"user": {"user_id": 1001, "nickname": "alice"}},
+                        {"user": {"user_id": 1002, "nickname": "bob"}},
+                        {"user": {"user_id": 1003, "nickname": "carol"}},
+                        {"user": {"user_id": 1004, "nickname": "dave"}}
+                    ]
+                }
+            }),
+        );
+        let events = feed(&mut b, 18, start);
+        match &events[0] {
+            MjaiEvent::StartGame { game_meta, .. } => {
+                match &game_meta.as_ref().expect("meta").match_info {
+                    Some(MatchInfo::RiichiCity { room_id, .. }) => {
+                        assert_eq!(room_id.as_deref(), Some("tabletoken0002"));
+                    }
+                    other => panic!("expected RiichiCity match_info, got {other:?}"),
+                }
+            }
+            other => panic!("expected StartGame for the second game, got {other:?}"),
+        }
+    }
+
+    /// A re-announcement of the *same* table (reconnect) is ignored, so a
+    /// partial payload can't clobber the collected roster.
+    #[test]
+    fn duplicate_same_table_enter_room_keeps_the_roster() {
+        let mut b = RiichiCityBridge::new(None, None);
+        auth(&mut b);
+        enter_room_4p(&mut b);
+        feed(
+            &mut b,
+            18,
+            json!({
+                "cmd": "cmd_enter_room",
+                "room_id": "tabletoken0001",
+                "data": {
+                    "options": { "classify_id": "classifytoken0001", "player_count": 4 },
+                    "players": []
+                }
+            }),
+        );
+        assert_eq!(b.status.player_list, vec![1001, 1002, 1003, 1004]);
+        assert_eq!(
+            b.status.nicknames.get(&1001).map(String::as_str),
+            Some("alice")
         );
     }
 
@@ -708,8 +1041,10 @@ mod tests {
                     "ben_chang_num": 0,
                     "li_zhi_bang_num": 0,
                     "user_info_list": [
-                        {"hand_points": 25000}, {"hand_points": 25000},
-                        {"hand_points": 25000}, {"hand_points": 25000}
+                        {"user_id": 1001, "hand_points": 25000},
+                        {"user_id": 1002, "hand_points": 25000},
+                        {"user_id": 1003, "hand_points": 25000},
+                        {"user_id": 1004, "hand_points": 25000}
                     ],
                     "hand_cards": [0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x01,0x02,0x03,0x04,0x05]
                 }
@@ -721,11 +1056,36 @@ mod tests {
                 id,
                 num_players,
                 names,
+                game_meta,
                 ..
             } => {
                 assert_eq!(*id, Some(0));
                 assert_eq!(*num_players, 4);
-                assert_eq!(names.len(), 4);
+                // dealer_pos 0 → no rotation, so names stay in enter-room
+                // order.
+                assert_eq!(
+                    names,
+                    &vec![
+                        "alice".to_string(),
+                        "bob".to_string(),
+                        "carol".to_string(),
+                        "dave".to_string(),
+                    ]
+                );
+                match &game_meta.as_ref().expect("riichi city meta").match_info {
+                    Some(MatchInfo::RiichiCity {
+                        room_id,
+                        classify_id,
+                        stage_type,
+                        game_play,
+                    }) => {
+                        assert_eq!(room_id.as_deref(), Some("tabletoken0001"));
+                        assert_eq!(classify_id.as_deref(), Some("classifytoken0001"));
+                        assert_eq!(*stage_type, Some(1));
+                        assert_eq!(*game_play, Some(1001));
+                    }
+                    other => panic!("expected RiichiCity match_info, got {other:?}"),
+                }
             }
             other => panic!("expected StartGame, got {other:?}"),
         }
@@ -762,6 +1122,59 @@ mod tests {
         }
     }
 
+    /// Regression for #215: `user_info_list` stays in fixed wire-seat order,
+    /// while MJAI actors are rotated so actor 0 is the first dealer.
+    #[test]
+    fn game_start_maps_scores_to_rotated_actor_order() {
+        let mut b = RiichiCityBridge::new(None, None);
+        auth(&mut b);
+        enter_room_4p(&mut b);
+
+        let events = feed(
+            &mut b,
+            18,
+            json!({
+                "cmd": "cmd_game_start",
+                "data": {
+                    "quan_feng": 0x31,
+                    "bao_pai_card": 0x21,
+                    "dealer_pos": 2,
+                    "ben_chang_num": 0,
+                    "li_zhi_bang_num": 0,
+                    "user_info_list": [
+                        {"user_id": 1001, "hand_points": 11100},
+                        {"user_id": 1002, "hand_points": 22200},
+                        {"user_id": 1003, "hand_points": 33300},
+                        {"user_id": 1004, "hand_points": 44400}
+                    ],
+                    "hand_cards": [0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x01,0x02,0x03,0x04]
+                }
+            }),
+        );
+
+        let scores = events.iter().find_map(|event| match event {
+            MjaiEvent::StartKyoku { scores, .. } => Some(scores),
+            _ => None,
+        });
+        assert_eq!(scores, Some(&vec![33300, 44400, 11100, 22200]));
+
+        // Names follow the same dealer rotation: enter-room order
+        // [alice, bob, carol, dave] rotated by dealer_pos 2.
+        let names = events.iter().find_map(|event| match event {
+            MjaiEvent::StartGame { names, .. } => Some(names),
+            _ => None,
+        });
+        assert_eq!(
+            names,
+            Some(&vec![
+                "carol".to_string(),
+                "dave".to_string(),
+                "alice".to_string(),
+                "bob".to_string(),
+            ])
+        );
+    }
+
     #[test]
     fn sanma_uses_native_length_three() {
         let mut b = RiichiCityBridge::new(None, None);
@@ -791,7 +1204,9 @@ mod tests {
                     "quan_feng": 0x31, "bao_pai_card": 0x21, "dealer_pos": 0,
                     "ben_chang_num": 0, "li_zhi_bang_num": 0,
                     "user_info_list": [
-                        {"hand_points": 35000}, {"hand_points": 35000}, {"hand_points": 35000}
+                        {"user_id": 1001, "hand_points": 35000},
+                        {"user_id": 1002, "hand_points": 35000},
+                        {"user_id": 1003, "hand_points": 35000}
                     ],
                     "hand_cards": [0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x01,0x02,0x03,0x04]
                 }
@@ -835,8 +1250,10 @@ mod tests {
                     "quan_feng": 0x31, "bao_pai_card": 0x21, "dealer_pos": 0,
                     "ben_chang_num": 0, "li_zhi_bang_num": 0,
                     "user_info_list": [
-                        {"hand_points": 25000}, {"hand_points": 25000},
-                        {"hand_points": 25000}, {"hand_points": 25000}
+                        {"user_id": 1001, "hand_points": 25000},
+                        {"user_id": 1002, "hand_points": 25000},
+                        {"user_id": 1003, "hand_points": 25000},
+                        {"user_id": 1004, "hand_points": 25000}
                     ],
                     "hand_cards": [0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x01,0x02,0x03,0x04,0x05]
                 }
@@ -861,6 +1278,127 @@ mod tests {
             }
             other => panic!("expected Tsumo, got {other:?}"),
         }
+    }
+
+    /// Tsumogiri is inferred from the rack-slot sentinel plus a live
+    /// draw: `move_cards_pos[0]` equal to the seat's rack size
+    /// (`13 - 3*melds + 1`) on a turn that drew — the client racks the
+    /// held draw last and clamps tedashi below it.
+    #[test]
+    fn tsumogiri_needs_a_draw_and_the_drawn_slot() {
+        let mut b = started_4p();
+        // Seat 1 draws, then discards the drawn slot → tsumogiri.
+        feed(
+            &mut b,
+            18,
+            json!({"cmd": "cmd_in_card_brc", "data": {"user_id": 1002, "card": 0}}),
+        );
+        let e = feed(
+            &mut b,
+            18,
+            json!({"cmd": "cmd_game_action_brc", "data": {"action_info": [
+                {"action": 11, "user_id": 1002, "card": 0x25, "move_cards_pos": [14], "is_li_zhi": false}
+            ]}}),
+        );
+        assert!(matches!(
+            &e[0],
+            MjaiEvent::Dahai {
+                actor: 1,
+                tsumogiri: true,
+                ..
+            }
+        ));
+
+        // Seat 2 draws but discards a lower slot → tedashi.
+        feed(
+            &mut b,
+            18,
+            json!({"cmd": "cmd_in_card_brc", "data": {"user_id": 1003, "card": 0}}),
+        );
+        let e = feed(
+            &mut b,
+            18,
+            json!({"cmd": "cmd_game_action_brc", "data": {"action_info": [
+                {"action": 11, "user_id": 1003, "card": 0x25, "move_cards_pos": [13], "is_li_zhi": false}
+            ]}}),
+        );
+        assert!(matches!(
+            &e[0],
+            MjaiEvent::Dahai {
+                actor: 2,
+                tsumogiri: false,
+                ..
+            }
+        ));
+    }
+
+    /// After a call the rack shrinks: the tsumogiri sentinel follows the
+    /// seat's meld count, and a post-call discard (no draw) is never
+    /// tsumogiri even when it names the rack's last slot.
+    #[test]
+    fn tsumogiri_slot_follows_the_melded_rack() {
+        let mut b = started_4p();
+        // Seat 1 draws and discards; we pon it and must now discard from
+        // an 11-slot rack without drawing.
+        feed(
+            &mut b,
+            18,
+            json!({"cmd": "cmd_in_card_brc", "data": {"user_id": 1002, "card": 0}}),
+        );
+        feed(
+            &mut b,
+            18,
+            json!({"cmd": "cmd_game_action_brc", "data": {"action_info": [
+                {"action": 11, "user_id": 1002, "card": 0x25, "move_cards_pos": [14], "is_li_zhi": false}
+            ]}}),
+        );
+        feed(
+            &mut b,
+            18,
+            json!({"cmd": "cmd_game_action_brc", "data": {"action_info": [
+                {"action": 5, "user_id": 1001, "card": 0x25, "group_cards": [0x25, 0x25]}
+            ]}}),
+        );
+        let e = feed(
+            &mut b,
+            18,
+            json!({"cmd": "cmd_game_action_brc", "data": {"action_info": [
+                {"action": 11, "user_id": 1001, "card": 0x31, "move_cards_pos": [11], "is_li_zhi": false}
+            ]}}),
+        );
+        assert!(
+            matches!(
+                &e[0],
+                MjaiEvent::Dahai {
+                    actor: 0,
+                    tsumogiri: false,
+                    ..
+                }
+            ),
+            "post-call discard is tedashi even at the last slot"
+        );
+
+        // Next turn we draw; slot 11 now IS the drawn slot.
+        feed(
+            &mut b,
+            18,
+            json!({"cmd": "cmd_send_current_action", "data": {"in_card": 0x05}}),
+        );
+        let e = feed(
+            &mut b,
+            18,
+            json!({"cmd": "cmd_game_action_brc", "data": {"action_info": [
+                {"action": 11, "user_id": 1001, "card": 0x05, "move_cards_pos": [11], "is_li_zhi": false}
+            ]}}),
+        );
+        assert!(matches!(
+            &e[0],
+            MjaiEvent::Dahai {
+                actor: 0,
+                tsumogiri: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -926,58 +1464,252 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ankan_marks_red_five() {
-        let mut b = started_4p();
-        let e = feed(
-            &mut b,
+    /// Feed one `cmd_game_action_brc` entry.
+    fn act(b: &mut RiichiCityBridge, action: Value) -> Vec<MjaiEvent> {
+        feed(
+            b,
             18,
-            json!({"cmd": "cmd_game_action_brc", "data": {"action_info": [
-                {"action": 8, "user_id": 1001, "card": 0x25}
-            ]}}),
-        );
-        match &e[0] {
-            MjaiEvent::Ankan { actor, consumed } => {
-                assert_eq!(*actor, 0);
-                assert_eq!(
-                    consumed,
-                    &[
-                        "5mr".to_string(),
-                        "5m".to_string(),
-                        "5m".to_string(),
-                        "5m".to_string()
-                    ]
-                );
-            }
-            other => panic!("expected Ankan, got {other:?}"),
+            json!({"cmd": "cmd_game_action_brc", "data": {"action_info": [action]}}),
+        )
+    }
+
+    fn ankan_of(b: &mut RiichiCityBridge, action: Value) -> Vec<String> {
+        match act(b, action).as_slice() {
+            [MjaiEvent::Ankan { consumed, .. }] => consumed.to_vec(),
+            other => panic!("expected one Ankan, got {other:?}"),
         }
     }
 
+    fn kakan_of(b: &mut RiichiCityBridge, action: Value) -> (String, Vec<String>) {
+        match act(b, action).as_slice() {
+            [MjaiEvent::Kakan { pai, consumed, .. }] => (pai.clone(), consumed.to_vec()),
+            other => panic!("expected one Kakan, got {other:?}"),
+        }
+    }
+
+    /// The client lists the four copies in rack-scan order with the red
+    /// five first, so the red can arrive as `card` itself; it used to be
+    /// repeated into all four slots.
     #[test]
-    fn kakan_with_red_added_tile_yields_plain_consumed() {
+    fn ankan_keeps_a_red_five_sent_as_card() {
         let mut b = started_4p();
-        let e = feed(
+        let consumed = ankan_of(
+            &mut b,
+            json!({"action": 8, "user_id": 1001, "card": 0x105,
+                   "group_cards": [0x05, 0x05, 0x05], "move_cards_pos": [5, 6, 7, 14]}),
+        );
+        assert_eq!(consumed, ["5pr", "5p", "5p", "5p"]);
+    }
+
+    #[test]
+    fn ankan_keeps_a_red_five_sent_in_group_cards() {
+        let mut b = started_4p();
+        let consumed = ankan_of(
+            &mut b,
+            json!({"action": 8, "user_id": 1001, "card": 0x25,
+                   "group_cards": [0x125, 0x25, 0x25], "move_cards_pos": [3, 4, 5, 6]}),
+        );
+        assert_eq!(consumed, ["5m", "5mr", "5m", "5m"]);
+    }
+
+    /// Four plain fives on the wire (a table without red fives) stay plain.
+    #[test]
+    fn ankan_without_a_red_five_stays_plain() {
+        let mut b = started_4p();
+        let fives = ankan_of(
+            &mut b,
+            json!({"action": 8, "user_id": 1001, "card": 0x15, "group_cards": [0x15, 0x15, 0x15]}),
+        );
+        assert_eq!(fives, ["5s", "5s", "5s", "5s"]);
+        let honors = ankan_of(
+            &mut b,
+            json!({"action": 8, "user_id": 1002, "card": 0x41, "group_cards": [0x41, 0x41, 0x41]}),
+        );
+        assert_eq!(honors, ["S", "S", "S", "S"]);
+    }
+
+    /// Missing or mismatched `group_cards` (or two reds) falls back to one
+    /// red per suit, whichever form `card` is in.
+    #[test]
+    fn ankan_without_group_cards_infers_one_red() {
+        let mut b = started_4p();
+        let plain = ankan_of(&mut b, json!({"action": 8, "user_id": 1001, "card": 0x25}));
+        assert_eq!(plain, ["5mr", "5m", "5m", "5m"]);
+        let red = ankan_of(&mut b, json!({"action": 8, "user_id": 1002, "card": 0x105}));
+        assert_eq!(red, ["5pr", "5p", "5p", "5p"]);
+        let mismatched = ankan_of(
+            &mut b,
+            json!({"action": 8, "user_id": 1003, "card": 0x15, "group_cards": [0x15, 0x16, 0x15]}),
+        );
+        assert_eq!(mismatched, ["5sr", "5s", "5s", "5s"]);
+        let two_reds = ankan_of(
+            &mut b,
+            json!({"action": 8, "user_id": 1004, "card": 0x125, "group_cards": [0x125, 0x25, 0x25]}),
+        );
+        assert_eq!(two_reds, ["5mr", "5m", "5m", "5m"]);
+    }
+
+    /// Chi, pon and daiminkan read the called tile from `card` and the
+    /// hand tiles from `group_cards`, so a red five keeps its place in
+    /// either. The pon shapes are from captured broadcasts; chi and
+    /// daiminkan use the same two fields.
+    #[test]
+    fn calls_keep_red_fives_as_sent() {
+        let mut b = started_4p();
+        act(
+            &mut b,
+            json!({"action": 11, "user_id": 1004, "card": 0x105, "move_cards_pos": [14], "is_li_zhi": false}),
+        );
+        match act(
+            &mut b,
+            json!({"action": 3, "user_id": 1001, "card": 0x105, "group_cards": [0x04, 0x06]}),
+        )
+        .as_slice()
+        {
+            [MjaiEvent::Chi { pai, consumed, .. }] => {
+                assert_eq!(pai, "5pr");
+                assert_eq!(consumed, &["4p", "6p"]);
+            }
+            other => panic!("expected Chi, got {other:?}"),
+        }
+        match act(
+            &mut b,
+            json!({"action": 2, "user_id": 1002, "card": 0x14, "group_cards": [0x115, 0x16]}),
+        )
+        .as_slice()
+        {
+            [MjaiEvent::Chi { pai, consumed, .. }] => {
+                assert_eq!(pai, "4s");
+                assert_eq!(consumed, &["5sr", "6s"]);
+            }
+            other => panic!("expected Chi, got {other:?}"),
+        }
+        match act(
+            &mut b,
+            json!({"action": 5, "user_id": 1003, "card": 0x105, "group_cards": [0x05, 0x05]}),
+        )
+        .as_slice()
+        {
+            [MjaiEvent::Pon { pai, consumed, .. }] => {
+                assert_eq!(pai, "5pr");
+                assert_eq!(consumed, &["5p", "5p"]);
+            }
+            other => panic!("expected Pon, got {other:?}"),
+        }
+        match act(
+            &mut b,
+            json!({"action": 5, "user_id": 1004, "card": 0x15, "group_cards": [0x115, 0x15]}),
+        )
+        .as_slice()
+        {
+            [MjaiEvent::Pon { pai, consumed, .. }] => {
+                assert_eq!(pai, "5s");
+                assert_eq!(consumed, &["5sr", "5s"]);
+            }
+            other => panic!("expected Pon, got {other:?}"),
+        }
+        match act(
+            &mut b,
+            json!({"action": 6, "user_id": 1001, "card": 0x25, "group_cards": [0x125, 0x25, 0x25]}),
+        )
+        .as_slice()
+        {
+            [MjaiEvent::Daiminkan { pai, consumed, .. }] => {
+                assert_eq!(pai, "5m");
+                assert_eq!(consumed, &["5mr", "5m", "5m"]);
+            }
+            other => panic!("expected Daiminkan, got {other:?}"),
+        }
+        match act(
+            &mut b,
+            json!({"action": 6, "user_id": 1002, "card": 0x125, "group_cards": [0x25, 0x25, 0x25]}),
+        )
+        .as_slice()
+        {
+            [MjaiEvent::Daiminkan { pai, consumed, .. }] => {
+                assert_eq!(pai, "5mr");
+                assert_eq!(consumed, &["5m", "5m", "5m"]);
+            }
+            other => panic!("expected Daiminkan, got {other:?}"),
+        }
+    }
+
+    /// A kakan broadcast carries no `group_cards`; `consumed` is the pon
+    /// the seat called, red five and all.
+    #[test]
+    fn kakan_takes_consumed_from_the_pon() {
+        let mut b = started_4p();
+        act(
+            &mut b,
+            json!({"action": 5, "user_id": 1001, "card": 0x05, "group_cards": [0x105, 0x05]}),
+        );
+        let (pai, consumed) = kakan_of(
+            &mut b,
+            json!({"action": 9, "user_id": 1001, "card": 0x05, "group_cards": [], "move_cards_pos": [11]}),
+        );
+        assert_eq!(pai, "5p");
+        assert_eq!(consumed, ["5p", "5pr", "5p"]);
+
+        // A pon of three plain fives stays plain under either added tile.
+        act(
+            &mut b,
+            json!({"action": 5, "user_id": 1002, "card": 0x15, "group_cards": [0x15, 0x15]}),
+        );
+        let (pai, consumed) = kakan_of(&mut b, json!({"action": 9, "user_id": 1002, "card": 0x15}));
+        assert_eq!(pai, "5s");
+        assert_eq!(consumed, ["5s", "5s", "5s"]);
+
+        // The pon is matched by seat and kind: seat 3 holds two, and the
+        // red added tile finds the plain-five pon.
+        act(
+            &mut b,
+            json!({"action": 5, "user_id": 1003, "card": 0x41, "group_cards": [0x41, 0x41]}),
+        );
+        act(
+            &mut b,
+            json!({"action": 5, "user_id": 1003, "card": 0x25, "group_cards": [0x25, 0x25]}),
+        );
+        let (pai, consumed) =
+            kakan_of(&mut b, json!({"action": 9, "user_id": 1003, "card": 0x125}));
+        assert_eq!(pai, "5mr");
+        assert_eq!(consumed, ["5m", "5m", "5m"]);
+        let (_, consumed) = kakan_of(&mut b, json!({"action": 9, "user_id": 1003, "card": 0x41}));
+        assert_eq!(consumed, ["S", "S", "S"]);
+    }
+
+    /// With no pon seen (e.g. joined mid-kyoku) the pon is inferred as one
+    /// red per suit.
+    #[test]
+    fn kakan_without_a_tracked_pon_infers_consumed() {
+        let mut b = started_4p();
+        let (pai, consumed) =
+            kakan_of(&mut b, json!({"action": 9, "user_id": 1001, "card": 0x125}));
+        assert_eq!(pai, "5mr");
+        assert_eq!(consumed, ["5m", "5m", "5m"]);
+        let (pai, consumed) = kakan_of(&mut b, json!({"action": 9, "user_id": 1002, "card": 0x25}));
+        assert_eq!(pai, "5m");
+        assert_eq!(consumed, ["5mr", "5m", "5m"]);
+    }
+
+    /// Pons don't carry into the next kyoku.
+    #[test]
+    fn tracked_pons_reset_at_the_next_kyoku() {
+        let mut b = started_4p();
+        act(
+            &mut b,
+            json!({"action": 5, "user_id": 1001, "card": 0x15, "group_cards": [0x15, 0x15]}),
+        );
+        feed(
             &mut b,
             18,
-            json!({"cmd": "cmd_game_action_brc", "data": {"action_info": [
-                {"action": 9, "user_id": 1001, "card": 0x125}
-            ]}}),
+            json!({"cmd": "cmd_game_start", "data": {
+                "quan_feng": 0x31, "bao_pai_card": 0x21, "dealer_pos": 1,
+                "ben_chang_num": 0, "li_zhi_bang_num": 0,
+                "hand_cards": [0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x01,0x02,0x03,0x04]
+            }}),
         );
-        match &e[0] {
-            MjaiEvent::Kakan {
-                actor,
-                pai,
-                consumed,
-            } => {
-                assert_eq!(*actor, 0);
-                assert_eq!(pai, "5mr");
-                assert_eq!(
-                    consumed,
-                    &["5m".to_string(), "5m".to_string(), "5m".to_string()]
-                );
-            }
-            other => panic!("expected Kakan, got {other:?}"),
-        }
+        let (_, consumed) = kakan_of(&mut b, json!({"action": 9, "user_id": 1001, "card": 0x15}));
+        assert_eq!(consumed, ["5sr", "5s", "5s"]);
     }
 
     #[test]
@@ -1212,7 +1944,7 @@ mod tests {
         let mut b = started_4p();
         let e = feed(&mut b, 18, json!({"cmd": "cmd_room_end", "data": {}}));
         assert_eq!(e.len(), 1);
-        assert!(matches!(e[0], MjaiEvent::EndGame));
+        assert!(matches!(e[0], MjaiEvent::EndGame { .. }));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! `FlowBridges<K>` lifts that pattern out so both backends share one
 //! lazy-create + ref-count-clean-up implementation.
 
-use crate::bridge::{self, Bridge};
+use crate::bridge::{self, Bridge, BridgeHooks};
 use crate::config::Platform;
 use crate::logger::Session;
 use std::collections::HashMap;
@@ -28,6 +28,9 @@ pub type SharedBridge = Arc<StdMutex<Box<dyn Bridge>>>;
 pub struct FlowBridges<K> {
     session: Arc<Session>,
     platform: Platform,
+    /// Autoplay's shared slots, handed to every bridge this map creates.
+    /// Empty when the backend has no autoplay context (MITM proxy).
+    hooks: BridgeHooks,
     map: StdMutex<HashMap<K, SharedBridge>>,
     next_flow_id: AtomicU64,
 }
@@ -36,10 +39,11 @@ impl<K> FlowBridges<K>
 where
     K: Eq + Hash + Clone,
 {
-    pub fn new(session: Arc<Session>, platform: Platform) -> Self {
+    pub fn new(session: Arc<Session>, platform: Platform, hooks: BridgeHooks) -> Self {
         Self {
             session,
             platform,
+            hooks,
             map: StdMutex::new(HashMap::new()),
             next_flow_id: AtomicU64::new(1),
         }
@@ -70,6 +74,7 @@ where
                     self.platform,
                     flow_log,
                     Some(self.session.clone()),
+                    self.hooks.clone(),
                 )))
             })
             .clone()

@@ -4,8 +4,11 @@
 //! - `page`: the [`chromiumoxide::page::Page`] handle for the tab where
 //!   Majsoul (or another supported platform) is loaded. Written by
 //!   `src/capture/chromium/cdp.rs` when it observes a WebSocket whose URL
-//!   host matches a known platform; cleared when that WS closes. Read by
-//!   `AutoplayManager` whenever it needs to dispatch input.
+//!   host matches a known platform. The handle tracks the **tab**, not the
+//!   WebSocket: it survives the many short-lived Route-probe / lobby-
+//!   reconnect sockets Majsoul opens and closes during a game, and is
+//!   cleared only when its owning tab is removed from the page snapshot.
+//!   Read by `AutoplayManager` whenever it needs to dispatch input.
 //! - `canvas_rect`: cached `getBoundingClientRect()` of the game canvas,
 //!   used to translate 16:9-normalised coordinates into CSS pixels.
 //!   Filled lazily by the autoplay manager (one `Runtime.evaluate` per
@@ -24,6 +27,26 @@ use tokio::sync::RwLock;
 pub struct AutoplayContext {
     pub page: Arc<RwLock<Option<Page>>>,
     pub canvas_rect: Arc<RwLock<Option<CanvasRect>>>,
+    /// Server-granted time budget for the current decision window.
+    /// Written by the Majsoul bridge (see `autoplay::budget`), read by
+    /// the manager's delay model. Uses a `std::sync::RwLock` (not tokio)
+    /// because the writer is the bridge's synchronous `parse()` path.
+    pub time_budget: crate::autoplay::budget::SharedTimeBudget,
+    /// Counter of the client's own uplink input commands, bumped by the
+    /// Majsoul bridge as it parses. The manager takes a ticket before a
+    /// click and asks afterwards whether the count moved — the proof that
+    /// the click registered (see `autoplay::verify`).
+    pub input_watch: crate::autoplay::verify::SharedInputWatch,
+    /// Tenhou's hand at tile-index resolution plus its current decision
+    /// window, written by the Tenhou bridge (see `autoplay::tenhou_state`).
+    /// Read by the Tenhou autoplay planner, which encodes a client frame
+    /// rather than synthesising clicks.
+    pub tenhou_state: crate::autoplay::tenhou_state::SharedTenhouState,
+    /// Frame injection channel for platforms whose client is not a browser
+    /// page (Riichi City): the manager sends built wire frames, the MITM
+    /// proxy's client→server relay transmits them. The `in_game` gate is
+    /// maintained by the Riichi City bridge. See `autoplay::inject`.
+    pub inject: crate::autoplay::inject::SharedInjectBus,
 }
 
 impl AutoplayContext {

@@ -115,9 +115,26 @@ impl CaptureBackend for ChromiumBackend {
                 .context("reading chromium CDP endpoint (chromium failed to start?)")?;
         info!("chromium CDP endpoint: {cdp_endpoint}");
 
+        let mut hooks = ctx
+            .autoplay
+            .as_ref()
+            .map(|a| crate::bridge::BridgeHooks {
+                time_budget: Some(a.time_budget.clone()),
+                input_watch: Some(a.input_watch.clone()),
+                tenhou_state: Some(a.tenhou_state.clone()),
+                // Chromium has no injection relay; Riichi City autoplay
+                // only runs on the MITM path.
+                riichi_inject: None,
+                notify: None,
+                tenhou_journal: None,
+            })
+            .unwrap_or_default();
+        hooks.notify = Some(ctx.notify_bus.clone());
+        hooks.tenhou_journal = Some(crate::bridge::tenhou::journal::new_shared());
         let bridges = Arc::new(FlowBridges::<cdp::FlowKey>::new(
             ctx.session.clone(),
             ctx.platform,
+            hooks,
         ));
 
         let cdp_run = cdp::run(
@@ -126,6 +143,9 @@ impl CaptureBackend for ChromiumBackend {
             ctx.mjai_bus.clone(),
             ctx.session.inspector(),
             ctx.autoplay.clone(),
+            ctx.http.clone(),
+            ctx.notify_bus.clone(),
+            self.cfg.block_telemetry,
         );
         let mut cdp_fut = Box::pin(cdp_run);
         let shutdown_fut = shutdown.wait();
